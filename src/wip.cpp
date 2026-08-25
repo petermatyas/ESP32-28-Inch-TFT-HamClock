@@ -31,6 +31,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include "html_page.h"
+#include "satellites.h"
 #include "html_success.h"
 #include "digits60pt7b.h"
 
@@ -50,7 +51,7 @@ int tOffset = 0; // will be updated via configuration device time (Iphone) and l
 Preferences prefs;
 // --- globals ---
 uint8_t activePage = 1;
-const uint8_t MAX_PAGES = 7;
+const uint8_t MAX_PAGES = 8;
 unsigned long lastTouchMs = 0;
 bool wasTouching = false;
 int scanCount = 0;
@@ -146,6 +147,7 @@ bool redrawSolarSummaryPage1 = true;
 bool redrawSolarSummaryPage2 = true;
 bool redrawSolarSummaryPage3 = true;
 bool reDrawWiFiQualityPage = true;
+bool redrawSatellitePage = true;
 
 // Relative x-offsets for HB97DIGITS12pt7b font layout
 const int xOffsets[8] = {
@@ -679,6 +681,8 @@ for (int i = 0; i < 4; i++) {
                           drawOrredrawStaticElements(); // 🖼️ Redraw Big Clock frames
                       });
 
+            satellitesRegisterRoutes(server);
+
             server.begin();
 
             // Initialize NTP Client
@@ -693,6 +697,7 @@ for (int i = 0; i < 4; i++) {
 
             fetchWeatherData();
             fetchSolarData();
+            satellitesBegin(latitude, longitude);
             drawOrredrawStaticElements();
 
             scrollingText.setColorDepth(8);
@@ -731,6 +736,11 @@ void loop()
 
     static unsigned long lastDotUpdate = 0;
     static bool screenSaver = false;
+
+    // 🛰️ Keeps the element sets fresh and hands the current time to the
+    // prediction task.  Rate-limits itself, so calling it every pass is fine.
+    satellitesLoop((time_t)timeClient.getEpochTime());
+
     if (!screenSaver)
     {
         handleTouchToRotatePage();
@@ -903,6 +913,7 @@ void loop()
             }
             break;
         case 7:
+        {
             currentMillis = millis();
             tft.setFreeFont(&digits60pt7b);
 
@@ -965,6 +976,15 @@ void loop()
                 LASTbigClockTimeStr = localTime;
             }
             break;
+        }
+
+        case 8:
+        {
+            satellitesDrawPage(tft, (time_t)timeClient.getEpochTime(), tOffset,
+                               redrawSatellitePage);
+            redrawSatellitePage = false;
+            break;
+        }
         }
 
     if (autoPageChange)
@@ -1737,6 +1757,10 @@ void handleTouchToRotatePage()
             if (activePage == 6)
             {
                 reDrawWiFiQualityPage = true;
+            }
+            if (activePage == 8)
+            {
+                redrawSatellitePage = true;
             }
             if (activePage == 7)
             {

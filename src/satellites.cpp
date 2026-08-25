@@ -1,0 +1,1124 @@
+// -----------------------------------------------------------------------------
+// satellites.cpp - satellite pass page (TFT page 8) and its web configurator
+//
+// Layout of this file:
+//   1. configuration + state          5. web routes
+//   2. SPIFFS config / TLE cache      6. live look angles
+//   3. TLE download (main loop)       7. TFT page rendering
+//   4. prediction task                8. public entry points
+//
+// The font headers define everything as file-scope const, so including them
+// here gives this translation unit its own copy (a few kB of flash) rather than
+// a duplicate-symbol error.
+// -----------------------------------------------------------------------------
+#include "satellites.h"
+
+#include <SPIFFS.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include <math.h>
+
+#include <sgp4.h>
+
+#include <UbuntuMono_Regular8pt7b.h>
+#include <JetBrainsMono_Light7pt7b.h>
+#include <JetBrainsMono_Bold11pt7b.h>
+#include <HB9IIUOrbitronMed8pt.h>
+
+// =============================================================================
+// 1. Configuration and state
+// =============================================================================
+
+static const char *SAT_CONFIG_FILE = "/satellites.json";
+static const double DEG2RAD_L = 0.017453292519943295;
+
+struct SatSlot {
+    uint32_t     norad;
+    char         name[26];
+    char         tle1[71];
+    char         tle2[71];
+    uint32_t     fetchedUnix;      // when the TLE was downloaded
+    bool         tleLoaded;        // element set lines present
+    bool         recValid;         // parsed into a usable SatRec
+    int          recError;
+    sgp4::SatRec rec;
+    uint8_t      failures;
+    uint32_t     retryAfterUnix;   // backoff after a failed download
+    char         status[40];
+};
+
+struct PassRow {
+    uint8_t    slot;
+    sgp4::Pass p;
+};
+
+static SatSlot  g_slots[SAT_MAX_SATS];
+static uint8_t  g_slotCount = 0;
+
+static PassRow  g_passes[SAT_MAX_SATS * SAT_PASSES_PER_SAT];
+static uint8_t  g_passCount = 0;
+static volatile uint32_t g_passVersion = 0;
+static uint32_t g_predictedAtUnix = 0;
+static bool     g_predictBusy = false;
+
+// configuration (defaults are used until /satellites.json exists)
+static double  g_minElevation    = 5.0;
+static uint8_t g_maxShown        = 5;
+static uint8_t g_horizonDays     = 3;
+static uint8_t g_tleRefreshHours = 12;
+static bool    g_useLocalTime    = true;
+static double  g_altitudeM       = 150.0;
+
+static double  g_latDeg = 0.0, g_lonDeg = 0.0;
+
+static volatile time_t   g_nowUnix      = 0;
+static volatile bool     g_needPredict  = false;
+static SemaphoreHandle_t g_mutex        = NULL;
+static SemaphoreHandle_t g_predictSignal = NULL;
+
+#define SAT_LOCK()   xSemaphoreTake(g_mutex, portMAX_DELAY)
+#define SAT_UNLOCK() xSemaphoreGive(g_mutex)
+
+static void ensureSync()
+{
+    if (!g_mutex)         g_mutex         = xSemaphoreCreateMutex();
+    if (!g_predictSignal) g_predictSignal = xSemaphoreCreateBinary();
+}
+
+static void requestPrediction()
+{
+    g_needPredict = true;
+    if (g_predictSignal) xSemaphoreGive(g_predictSignal);
+}
+
+// =============================================================================
+// 2. SPIFFS: configuration and TLE cache
+// =============================================================================
+
+static void tleCachePath(uint32_t norad, char *out, size_t n)
+{
+    snprintf(out, n, "/tle/%lu.txt", (unsigned long)norad);
+}
+
+// Re-run the SGP4 initialisation for one slot.  Caller holds the mutex.
+static void reparseSlot(SatSlot &s)
+{
+    s.recValid = false;
+    s.recError = 0;
+    if (!s.tleLoaded) {
+        snprintf(s.status, sizeof(s.status), "no TLE yet");
+        return;
+    }
+    if (sgp4::parseTle(s.tle1, s.tle2, s.rec)) {
+        s.recValid = true;
+        snprintf(s.status, sizeof(s.status), "ok, %.1f min orbit", s.rec.periodMin);
+    } else {
+        s.recError = s.rec.error;
+        if (s.rec.deepSpace)
+            snprintf(s.status, sizeof(s.status), "deep-space object, unsupported");
+        else
+            snprintf(s.status, sizeof(s.status), "bad element set (err %d)", s.rec.error);
+    }
+}
+
+static void loadTleCache(SatSlot &s)
+{
+    char path[32];
+    tleCachePath(s.norad, path, sizeof(path));
+
+    fs::File f = SPIFFS.open(path, "r");
+    if (!f) return;
+
+    String fetched = f.readStringUntil('\n');
+    String name    = f.readStringUntil('\n');
+    String l1      = f.readStringUntil('\n');
+    String l2      = f.readStringUntil('\n');
+    f.close();
+
+    l1.trim();
+    l2.trim();
+    name.trim();
+    if (l1.length() < 68 || l2.length() < 68) return;
+
+    s.fetchedUnix = (uint32_t)fetched.toInt();
+    strlcpy(s.name, name.c_str(), sizeof(s.name));
+    strlcpy(s.tle1, l1.c_str(), sizeof(s.tle1));
+    strlcpy(s.tle2, l2.c_str(), sizeof(s.tle2));
+    s.tleLoaded = true;
+    reparseSlot(s);
+}
+
+static void saveTleCache(const SatSlot &s)
+{
+    char path[32];
+    tleCachePath(s.norad, path, sizeof(path));
+
+    fs::File f = SPIFFS.open(path, "w");
+    if (!f) {
+        Serial.printf("🛰️ could not write %s\n", path);
+        return;
+    }
+    f.printf("%lu\n%s\n%s\n%s\n", (unsigned long)s.fetchedUnix, s.name, s.tle1, s.tle2);
+    f.close();
+}
+
+static void saveConfig()
+{
+    JsonDocument doc;
+    doc["minElevation"]    = g_minElevation;
+    doc["maxShown"]        = g_maxShown;
+    doc["horizonDays"]     = g_horizonDays;
+    doc["tleRefreshHours"] = g_tleRefreshHours;
+    doc["useLocalTime"]    = g_useLocalTime;
+    doc["altitudeM"]       = g_altitudeM;
+
+    JsonArray arr = doc["sats"].to<JsonArray>();
+    for (uint8_t i = 0; i < g_slotCount; i++) arr.add(g_slots[i].norad);
+
+    fs::File f = SPIFFS.open(SAT_CONFIG_FILE, "w");
+    if (!f) {
+        Serial.println("🛰️ could not write /satellites.json");
+        return;
+    }
+    serializeJsonPretty(doc, f);
+    f.close();
+    Serial.printf("🛰️ config saved, %u satellite(s)\n", g_slotCount);
+}
+
+static void loadConfig()
+{
+    fs::File f = SPIFFS.open(SAT_CONFIG_FILE, "r");
+    if (!f) {
+        Serial.println("🛰️ no /satellites.json yet - starting with an empty list");
+        return;
+    }
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err) {
+        Serial.printf("🛰️ /satellites.json is unreadable (%s) - using defaults\n", err.c_str());
+        return;
+    }
+
+    g_minElevation    = doc["minElevation"]    | g_minElevation;
+    g_maxShown        = doc["maxShown"]        | g_maxShown;
+    g_horizonDays     = doc["horizonDays"]     | g_horizonDays;
+    g_tleRefreshHours = doc["tleRefreshHours"] | g_tleRefreshHours;
+    g_useLocalTime    = doc["useLocalTime"]    | g_useLocalTime;
+    g_altitudeM       = doc["altitudeM"]       | g_altitudeM;
+
+    if (g_maxShown < 1) g_maxShown = 1;
+    if (g_maxShown > 5) g_maxShown = 5;
+    if (g_horizonDays < 1) g_horizonDays = 1;
+    if (g_horizonDays > 5) g_horizonDays = 5;
+    if (g_tleRefreshHours < 1) g_tleRefreshHours = 1;
+    if (g_minElevation < 0.0)  g_minElevation = 0.0;
+    if (g_minElevation > 60.0) g_minElevation = 60.0;
+
+    g_slotCount = 0;
+    JsonArray arr = doc["sats"].as<JsonArray>();
+    for (JsonVariant v : arr) {
+        if (g_slotCount >= SAT_MAX_SATS) break;
+        uint32_t id = v.as<uint32_t>();
+        if (id == 0) continue;
+        SatSlot &s = g_slots[g_slotCount];
+        memset(&s, 0, sizeof(s));
+        s.norad = id;
+        snprintf(s.name, sizeof(s.name), "%lu", (unsigned long)id);
+        snprintf(s.status, sizeof(s.status), "no TLE yet");
+        loadTleCache(s);
+        g_slotCount++;
+    }
+    Serial.printf("🛰️ config loaded: %u satellite(s), minEl %.0f deg\n",
+                  g_slotCount, g_minElevation);
+}
+
+// =============================================================================
+// 3. TLE download
+// =============================================================================
+
+// Pull the three TLE lines out of a Celestrak GP response.
+static bool parseTleResponse(const String &body, char *name, size_t nameLen,
+                             char *l1, size_t l1Len, char *l2, size_t l2Len)
+{
+    if (body.indexOf("No GP data found") >= 0) return false;
+
+    String firstName;
+    bool haveL1 = false, haveL2 = false;
+
+    int start = 0;
+    while (start < (int)body.length()) {
+        int nl = body.indexOf('\n', start);
+        if (nl < 0) nl = body.length();
+        String line = body.substring(start, nl);
+        start = nl + 1;
+
+        line.replace("\r", "");
+        while (line.length() && line[line.length() - 1] == ' ')
+            line.remove(line.length() - 1);
+        if (line.length() == 0) continue;
+
+        if (!haveL1 && line.startsWith("1 ") && line.length() >= 68) {
+            strlcpy(l1, line.c_str(), l1Len);
+            haveL1 = true;
+        } else if (haveL1 && !haveL2 && line.startsWith("2 ") && line.length() >= 68) {
+            strlcpy(l2, line.c_str(), l2Len);
+            haveL2 = true;
+        } else if (firstName.length() == 0 && !haveL1) {
+            firstName = line;
+        }
+    }
+
+    if (!haveL1 || !haveL2) return false;
+    strlcpy(name, firstName.length() ? firstName.c_str() : "UNKNOWN", nameLen);
+    return true;
+}
+
+// Blocking HTTP fetch for one satellite.  Runs on the main loop, like the
+// existing weather and propagation fetches, so only one TLS session is ever
+// open at a time.
+static void fetchTleFor(uint8_t idx, time_t now)
+{
+    uint32_t norad;
+    SAT_LOCK();
+    norad = g_slots[idx].norad;
+    SAT_UNLOCK();
+    if (!norad) return;
+
+    char url[128];
+    snprintf(url, sizeof(url),
+             "https://celestrak.org/NORAD/elements/gp.php?CATNR=%lu&FORMAT=TLE",
+             (unsigned long)norad);
+
+    HTTPClient http;
+    http.setTimeout(8000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (!http.begin(url)) {
+        Serial.printf("🛰️ %lu: http begin failed\n", (unsigned long)norad);
+        return;
+    }
+    http.setUserAgent("ESP32-HamClock/1.0 (satellite pass page)");
+
+    int code = http.GET();
+    String body = (code == HTTP_CODE_OK) ? http.getString() : String();
+    http.end();
+
+    char name[26], l1[71], l2[71];
+    bool ok = (code == HTTP_CODE_OK) &&
+              parseTleResponse(body, name, sizeof(name), l1, sizeof(l1), l2, sizeof(l2));
+
+    SAT_LOCK();
+    SatSlot &s = g_slots[idx];
+    if (s.norad != norad) { SAT_UNLOCK(); return; }   // list changed under us
+
+    if (ok) {
+        strlcpy(s.name, name, sizeof(s.name));
+        strlcpy(s.tle1, l1,   sizeof(s.tle1));
+        strlcpy(s.tle2, l2,   sizeof(s.tle2));
+        s.tleLoaded    = true;
+        s.fetchedUnix  = (uint32_t)now;
+        s.failures     = 0;
+        s.retryAfterUnix = 0;
+        reparseSlot(s);
+        Serial.printf("🛰️ %lu -> %s (%s)\n", (unsigned long)norad, s.name, s.status);
+    } else {
+        if (s.failures < 8) s.failures++;
+        // Exponential backoff, capped at an hour, so a wrong id or an outage
+        // does not turn into a request loop against Celestrak.
+        uint32_t backoff = 60u << (s.failures - 1);
+        if (backoff > 3600u) backoff = 3600u;
+        s.retryAfterUnix = (uint32_t)now + backoff;
+        if (code != HTTP_CODE_OK)
+            snprintf(s.status, sizeof(s.status), "download failed (HTTP %d)", code);
+        else
+            snprintf(s.status, sizeof(s.status), "no element set for this id");
+        Serial.printf("🛰️ %lu: %s, retry in %lus\n",
+                      (unsigned long)norad, s.status, (unsigned long)backoff);
+    }
+    SAT_UNLOCK();
+
+    if (ok) {
+        saveTleCache(g_slots[idx]);   // outside the lock: SPIFFS can be slow
+        requestPrediction();
+    }
+}
+
+// =============================================================================
+// 4. Prediction task
+// =============================================================================
+
+static void satYield() { vTaskDelay(1); }
+
+static void runPrediction(time_t now)
+{
+    // Task-private snapshots, kept out of the task stack.
+    static sgp4::SatRec work[SAT_MAX_SATS];
+    static bool         workOk[SAT_MAX_SATS];
+    static PassRow      tmp[SAT_MAX_SATS * SAT_PASSES_PER_SAT];
+
+    double latRad, lonRad, altKm, minEl;
+    uint8_t count, horizonDays;
+
+    SAT_LOCK();
+    count       = g_slotCount;
+    latRad      = g_latDeg * DEG2RAD_L;
+    lonRad      = g_lonDeg * DEG2RAD_L;
+    altKm       = g_altitudeM / 1000.0;
+    minEl       = g_minElevation;
+    horizonDays = g_horizonDays;
+    for (uint8_t i = 0; i < count; i++) {
+        workOk[i] = g_slots[i].recValid;
+        if (workOk[i]) memcpy(&work[i], &g_slots[i].rec, sizeof(sgp4::SatRec));
+    }
+    SAT_UNLOCK();
+
+    uint8_t n = 0;
+    uint32_t startedMs = millis();
+
+    for (uint8_t i = 0; i < count; i++) {
+        if (!workOk[i]) continue;
+
+        double t = (double)now;
+        for (uint8_t k = 0; k < SAT_PASSES_PER_SAT; k++) {
+            sgp4::Pass p;
+            if (!sgp4::findNextPass(work[i], t, horizonDays * 86400.0,
+                                    latRad, lonRad, altKm, minEl, p, satYield))
+                break;
+            tmp[n].slot = i;
+            tmp[n].p    = p;
+            n++;
+            t = p.losUnix + 60.0;
+            vTaskDelay(1);
+        }
+        vTaskDelay(1);
+    }
+
+    // Merge the per-satellite results into one AOS-ordered timeline.
+    for (uint8_t i = 1; i < n; i++) {
+        PassRow key = tmp[i];
+        int j = i - 1;
+        while (j >= 0 && tmp[j].p.aosUnix > key.p.aosUnix) {
+            tmp[j + 1] = tmp[j];
+            j--;
+        }
+        tmp[j + 1] = key;
+    }
+
+    SAT_LOCK();
+    memcpy(g_passes, tmp, sizeof(PassRow) * n);
+    g_passCount       = n;
+    g_predictedAtUnix = (uint32_t)now;
+    g_passVersion++;
+    SAT_UNLOCK();
+
+    Serial.printf("🛰️ predicted %u pass(es) in %lu ms\n",
+                  n, (unsigned long)(millis() - startedMs));
+}
+
+static void satPredictTask(void *)
+{
+    for (;;) {
+        // Wake on request, and in any case every 15 s to retire finished passes.
+        xSemaphoreTake(g_predictSignal, pdMS_TO_TICKS(15000));
+
+        time_t now = g_nowUnix;
+        if (now < 1600000000L) continue;      // NTP has not delivered yet
+
+        if (!g_needPredict) {
+            bool stale = false;
+            SAT_LOCK();
+            if (g_passCount == 0 && g_slotCount > 0 && g_predictedAtUnix == 0) stale = true;
+            for (uint8_t i = 0; i < g_passCount; i++)
+                if (g_passes[i].p.losUnix < (double)now) { stale = true; break; }
+            SAT_UNLOCK();
+            if (!stale) continue;
+        }
+
+        g_needPredict = false;
+        g_predictBusy = true;
+        runPrediction(now);
+        g_predictBusy = false;
+    }
+}
+
+// =============================================================================
+// 5. Web routes
+// =============================================================================
+
+static void handleSatPage(WebServer &server)
+{
+    fs::File f = SPIFFS.open("/sat.html", "r");
+    if (!f) {
+        server.send(404, "text/plain", "sat.html is missing - upload the SPIFFS image");
+        return;
+    }
+    server.streamFile(f, "text/html");
+    f.close();
+}
+
+static void buildConfigJson(String &out)
+{
+    JsonDocument doc;
+
+    SAT_LOCK();
+    doc["minElevation"]    = g_minElevation;
+    doc["maxShown"]        = g_maxShown;
+    doc["horizonDays"]     = g_horizonDays;
+    doc["tleRefreshHours"] = g_tleRefreshHours;
+    doc["useLocalTime"]    = g_useLocalTime;
+    doc["altitudeM"]       = g_altitudeM;
+    doc["latitude"]        = g_latDeg;
+    doc["longitude"]       = g_lonDeg;
+    doc["utc"]             = (uint32_t)g_nowUnix;
+    doc["predictedAt"]     = g_predictedAtUnix;
+    doc["busy"]            = g_predictBusy;
+    doc["maxSats"]         = SAT_MAX_SATS;
+
+    JsonArray arr = doc["sats"].to<JsonArray>();
+    for (uint8_t i = 0; i < g_slotCount; i++) {
+        SatSlot &s = g_slots[i];
+        JsonObject o = arr.add<JsonObject>();
+        o["norad"]  = s.norad;
+        o["name"]   = s.name;
+        o["ok"]     = s.recValid;
+        o["status"] = s.status;
+        o["deepSpace"] = s.recValid ? false : (s.recError == sgp4::ERR_DEEP_SPACE);
+        o["tleAgeH"] = (s.fetchedUnix && g_nowUnix > (time_t)s.fetchedUnix)
+                           ? ((double)(g_nowUnix - (time_t)s.fetchedUnix) / 3600.0)
+                           : -1.0;
+    }
+    SAT_UNLOCK();
+
+    serializeJson(doc, out);
+}
+
+static void handleSaveSatellites(WebServer &server)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"missing body\"}");
+        return;
+    }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"bad json\"}");
+        return;
+    }
+
+    // Keep the existing slots for ids that are still in the list, so a settings
+    // change does not throw away TLEs that were already downloaded.
+    static SatSlot old[SAT_MAX_SATS];   // too big for the loop task's stack
+    uint8_t oldCount;
+
+    SAT_LOCK();
+    memcpy(old, g_slots, sizeof(g_slots));
+    oldCount = g_slotCount;
+
+    g_minElevation    = doc["minElevation"]    | g_minElevation;
+    g_maxShown        = doc["maxShown"]        | g_maxShown;
+    g_horizonDays     = doc["horizonDays"]     | g_horizonDays;
+    g_tleRefreshHours = doc["tleRefreshHours"] | g_tleRefreshHours;
+    g_useLocalTime    = doc["useLocalTime"]    | g_useLocalTime;
+    g_altitudeM       = doc["altitudeM"]       | g_altitudeM;
+
+    if (g_maxShown < 1) g_maxShown = 1;
+    if (g_maxShown > 5) g_maxShown = 5;
+    if (g_horizonDays < 1) g_horizonDays = 1;
+    if (g_horizonDays > 5) g_horizonDays = 5;
+    if (g_tleRefreshHours < 1) g_tleRefreshHours = 1;
+    if (g_minElevation < 0.0)  g_minElevation = 0.0;
+    if (g_minElevation > 60.0) g_minElevation = 60.0;
+
+    g_slotCount = 0;
+    JsonArray arr = doc["sats"].as<JsonArray>();
+    for (JsonVariant v : arr) {
+        if (g_slotCount >= SAT_MAX_SATS) break;
+        uint32_t id = v.as<uint32_t>();
+        if (id == 0) continue;
+
+        bool duplicate = false;
+        for (uint8_t k = 0; k < g_slotCount; k++)
+            if (g_slots[k].norad == id) { duplicate = true; break; }
+        if (duplicate) continue;
+
+        SatSlot &s = g_slots[g_slotCount];
+        memset(&s, 0, sizeof(s));
+        s.norad = id;
+        snprintf(s.name, sizeof(s.name), "%lu", (unsigned long)id);
+        snprintf(s.status, sizeof(s.status), "no TLE yet");
+
+        for (uint8_t k = 0; k < oldCount; k++) {
+            if (old[k].norad == id) { memcpy(&s, &old[k], sizeof(SatSlot)); break; }
+        }
+        g_slotCount++;
+    }
+
+    g_passCount = 0;
+    g_passVersion++;
+    g_predictedAtUnix = 0;
+    SAT_UNLOCK();
+
+    saveConfig();
+    requestPrediction();
+
+    String out;
+    buildConfigJson(out);
+    server.send(200, "application/json", out);
+}
+
+static void handleSatPasses(WebServer &server)
+{
+    JsonDocument doc;
+    doc["utc"] = (uint32_t)g_nowUnix;
+    doc["useLocalTime"] = g_useLocalTime;
+
+    SAT_LOCK();
+    JsonArray arr = doc["passes"].to<JsonArray>();
+    for (uint8_t i = 0; i < g_passCount; i++) {
+        PassRow &r = g_passes[i];
+        JsonObject o = arr.add<JsonObject>();
+        o["norad"]   = g_slots[r.slot].norad;
+        o["name"]    = g_slots[r.slot].name;
+        o["aos"]     = (uint32_t)r.p.aosUnix;
+        o["los"]     = (uint32_t)r.p.losUnix;
+        o["max"]     = (uint32_t)r.p.maxUnix;
+        o["maxEl"]   = r.p.maxElDeg;
+        o["aosAz"]   = r.p.aosAzDeg;
+        o["losAz"]   = r.p.losAzDeg;
+    }
+    SAT_UNLOCK();
+
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+static void handleSatRefresh(WebServer &server)
+{
+    SAT_LOCK();
+    for (uint8_t i = 0; i < g_slotCount; i++) {
+        g_slots[i].fetchedUnix    = 0;
+        g_slots[i].failures       = 0;
+        g_slots[i].retryAfterUnix = 0;
+    }
+    SAT_UNLOCK();
+    server.send(200, "application/json", "{\"status\":\"refreshing\"}");
+}
+
+void satellitesRegisterRoutes(WebServer &server)
+{
+    ensureSync();
+    server.on("/sat.html",   HTTP_GET,  [&server]() { handleSatPage(server); });
+    server.on("/satellites", HTTP_GET,  [&server]() {
+        String out;
+        buildConfigJson(out);
+        server.send(200, "application/json", out);
+    });
+    server.on("/satellites", HTTP_POST, [&server]() { handleSaveSatellites(server); });
+    server.on("/satpasses",  HTTP_GET,  [&server]() { handleSatPasses(server); });
+    server.on("/satrefresh", HTTP_GET,  [&server]() { handleSatRefresh(server); });
+}
+
+// =============================================================================
+// 6. Live look angles
+// =============================================================================
+
+struct SatLive {
+    bool     active;
+    uint8_t  slot;
+    double   elDeg, azDeg, rangeKm;
+    bool     haveLos;
+    double   losUnix;
+    double   maxElDeg;
+};
+
+// Highest satellite currently above the configured minimum elevation.
+static bool computeLive(time_t now, SatLive &out)
+{
+    out.active  = false;
+    out.haveLos = false;
+
+    double best = -1000.0;
+    double jd = sgp4::jdFromUnix((double)now);
+
+    SAT_LOCK();
+    double latRad = g_latDeg * DEG2RAD_L;
+    double lonRad = g_lonDeg * DEG2RAD_L;
+    double altKm  = g_altitudeM / 1000.0;
+    double minEl  = g_minElevation;
+
+    for (uint8_t i = 0; i < g_slotCount; i++) {
+        if (!g_slots[i].recValid) continue;
+
+        double tsince = (jd - g_slots[i].rec.jdsatepoch) * 1440.0;
+        double r[3], v[3];
+        int err = 0;
+        if (!sgp4::propagate(g_slots[i].rec, tsince, r, v, &err)) continue;
+
+        sgp4::Look look;
+        sgp4::observe(r, v, jd, latRad, lonRad, altKm, look);
+        if (look.elDeg < minEl || look.elDeg <= best) continue;
+
+        best        = look.elDeg;
+        out.active  = true;
+        out.slot    = i;
+        out.elDeg   = look.elDeg;
+        out.azDeg   = look.azDeg;
+        out.rangeKm = look.rangeKm;
+    }
+
+    // Attach the LOS and culmination of the pass this satellite is in.
+    if (out.active) {
+        for (uint8_t i = 0; i < g_passCount; i++) {
+            if (g_passes[i].slot != out.slot) continue;
+            if (g_passes[i].p.aosUnix - 60.0 <= (double)now &&
+                g_passes[i].p.losUnix >= (double)now) {
+                out.haveLos  = true;
+                out.losUnix  = g_passes[i].p.losUnix;
+                out.maxElDeg = g_passes[i].p.maxElDeg;
+                break;
+            }
+        }
+    }
+    SAT_UNLOCK();
+
+    return out.active;
+}
+
+// =============================================================================
+// 7. TFT page rendering
+// =============================================================================
+
+// Layout constants (320x240, rotation 3).  y values are the top of the text,
+// which is what drawString() with TL_DATUM uses.
+static const int HDR_Y      = 2;
+static const int RULE1_Y    = 19;
+static const int BANNER_Y   = 22;
+static const int BANNER_H   = 46;
+static const int COLHDR_Y   = 74;
+static const int RULE2_Y    = 88;
+static const int ROW0_Y     = 94;
+static const int ROW_H      = 24;
+static const int RULE3_Y    = 212;
+static const int FOOTER_Y   = 218;
+
+static const int COL_NAME = 6;
+static const int COL_AOS  = 112;
+static const int COL_EL   = 170;
+static const int COL_DUR  = 205;
+static const int COL_AZ   = 252;
+
+static const char *compass16(double az)
+{
+    static const char *pts[16] = {"N","NNE","NE","ENE","E","ESE","SE","SSE",
+                                  "S","SSW","SW","WSW","W","WNW","NW","NNW"};
+    int idx = (int)floor(fmod(az + 11.25, 360.0) / 22.5);
+    if (idx < 0) idx = 0;
+    if (idx > 15) idx = 15;
+    return pts[idx];
+}
+
+static void fmtClock(time_t utc, int tOffsetHours, char *out, size_t n)
+{
+    time_t t = g_useLocalTime ? utc + (time_t)tOffsetHours * 3600 : utc;
+    struct tm tm_;
+    gmtime_r(&t, &tm_);
+    snprintf(out, n, "%02d:%02d", tm_.tm_hour, tm_.tm_min);
+}
+
+// "in 4d" / "01:23:45" / "04:12"
+static void fmtCountdown(long secs, char *out, size_t n)
+{
+    if (secs < 0) secs = 0;
+    if (secs >= 86400)      snprintf(out, n, "%ldd%02ldh", secs / 86400, (secs % 86400) / 3600);
+    else if (secs >= 3600)  snprintf(out, n, "%ld:%02ld:%02ld", secs / 3600, (secs % 3600) / 60, secs % 60);
+    else                    snprintf(out, n, "%02ld:%02ld", secs / 60, secs % 60);
+}
+
+static void fmtDuration(long secs, char *out, size_t n)
+{
+    if (secs < 0) secs = 0;
+    snprintf(out, n, "%02ld:%02ld", secs / 60, secs % 60);
+}
+
+// Pad to a fixed width so opaque text overwrites whatever was there before.
+static void padTo(char *s, size_t width, size_t bufLen)
+{
+    size_t len = strlen(s);
+    while (len < width && len + 1 < bufLen) s[len++] = ' ';
+    s[len] = '\0';
+}
+
+static void drawStaticFurniture(TFT_eSPI &tft)
+{
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+
+    tft.setFreeFont(&Orbitron_Medium8pt7b);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("SATELLITES", COL_NAME, HDR_Y);
+
+    tft.drawFastHLine(4, RULE1_Y, 312, TFT_DARKGREY);
+
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("SAT", COL_NAME, COLHDR_Y);
+    tft.drawString("AOS", COL_AOS,  COLHDR_Y);
+    tft.drawString("EL",  COL_EL,   COLHDR_Y);
+    tft.drawString("DUR", COL_DUR,  COLHDR_Y);
+    tft.drawString("AZ",  COL_AZ,   COLHDR_Y);
+
+    tft.drawFastHLine(4, RULE2_Y, 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, RULE3_Y, 312, TFT_DARKGREY);
+}
+
+static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
+{
+    struct tm tm_;
+    time_t shown = g_useLocalTime ? utc + (time_t)tOffsetHours * 3600 : utc;
+    gmtime_r(&shown, &tm_);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d %s",
+             tm_.tm_hour, tm_.tm_min, tm_.tm_sec, g_useLocalTime ? "LOC" : "UTC");
+
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, 314, HDR_Y + 2);
+    tft.setTextDatum(TL_DATUM);
+}
+
+static void drawBanner(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool force)
+{
+    static int lastState = -1;   // 0 idle, 1 pass in progress
+
+    SatLive live;
+    computeLive(utc, live);
+
+    int state = live.active ? 1 : 0;
+    uint16_t frame = live.active ? TFT_GREEN : TFT_DARKGREY;
+
+    if (force || state != lastState) {
+        tft.fillRect(3, BANNER_Y + 1, 314, BANNER_H - 2, TFT_BLACK);
+        tft.drawRoundRect(2, BANNER_Y, 316, BANNER_H, 6, frame);
+        lastState = state;
+    }
+
+    char line1[32], line2[48];
+    uint16_t colour;
+
+    if (live.active) {
+        char nm[19];
+        SAT_LOCK();
+        strlcpy(nm, g_slots[live.slot].name, sizeof(nm));
+        SAT_UNLOCK();
+
+        snprintf(line1, sizeof(line1), "NOW %s", nm);
+        padTo(line1, 22, sizeof(line1));
+        colour = TFT_GREEN;
+
+        char los[16];
+        if (live.haveLos) {
+            fmtCountdown((long)(live.losUnix - (double)utc), los, sizeof(los));
+            snprintf(line2, sizeof(line2), "EL %2.0f  AZ %3.0f %-3s  MAX %2.0f  LOS %s",
+                     live.elDeg, live.azDeg, compass16(live.azDeg),
+                     live.maxElDeg, los);
+        } else {
+            snprintf(line2, sizeof(line2), "EL %2.0f  AZ %3.0f %-3s  %.0f km",
+                     live.elDeg, live.azDeg, compass16(live.azDeg), live.rangeKm);
+        }
+    } else {
+        colour = TFT_DARKGREY;
+        strlcpy(line1, "NO PASS IN PROGRESS", sizeof(line1));
+        padTo(line1, 22, sizeof(line1));
+
+        // Next AOS from the predicted timeline.
+        bool found = false;
+        char nm[19] = {0};
+        double aos = 0;
+        SAT_LOCK();
+        uint8_t slots = g_slotCount;
+        for (uint8_t i = 0; i < g_passCount; i++) {
+            if (g_passes[i].p.aosUnix > (double)utc) {
+                strlcpy(nm, g_slots[g_passes[i].slot].name, sizeof(nm));
+                aos = g_passes[i].p.aosUnix;
+                found = true;
+                break;
+            }
+        }
+        SAT_UNLOCK();
+
+        if (found) {
+            char cd[16];
+            fmtCountdown((long)(aos - (double)utc), cd, sizeof(cd));
+            snprintf(line2, sizeof(line2), "Next %s in %s", nm, cd);
+        } else if (slots == 0) {
+            snprintf(line2, sizeof(line2), "Add NORAD ids on /sat.html");
+        } else {
+            snprintf(line2, sizeof(line2), "%s",
+                     g_predictBusy ? "Predicting..." : "No pass inside the horizon");
+        }
+    }
+
+    padTo(line2, 38, sizeof(line2));
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+    tft.setTextColor(colour, TFT_BLACK);
+    tft.drawString(line1, 10, BANNER_Y + 5);
+
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(colour, TFT_BLACK);
+    tft.drawString(line2, 10, BANNER_Y + 28);
+}
+
+static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool clearFirst)
+{
+    if (clearFirst)
+        tft.fillRect(0, RULE2_Y + 1, 320, RULE3_Y - RULE2_Y - 1, TFT_BLACK);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+
+    PassRow rows[5];
+    uint8_t shown = 0;
+    uint8_t configured;
+    char names[5][14];
+
+    SAT_LOCK();
+    configured = g_slotCount;
+    uint8_t limit = g_maxShown > 5 ? 5 : g_maxShown;
+    for (uint8_t i = 0; i < g_passCount && shown < limit; i++) {
+        if (g_passes[i].p.losUnix < (double)utc) continue;   // already over
+        rows[shown] = g_passes[i];
+        strlcpy(names[shown], g_slots[g_passes[i].slot].name, sizeof(names[shown]));
+        shown++;
+    }
+    SAT_UNLOCK();
+
+    for (uint8_t i = 0; i < 5; i++) {
+        int y = ROW0_Y + i * ROW_H;
+
+        if (i >= shown) {
+            tft.fillRect(0, y - 2, 320, ROW_H, TFT_BLACK);
+            continue;
+        }
+
+        const sgp4::Pass &p = rows[i].p;
+        uint16_t colour;
+        if (p.aosUnix <= (double)utc)              colour = TFT_GREEN;
+        else if (p.aosUnix - (double)utc < 600.0)  colour = TFT_YELLOW;
+        else                                       colour = TFT_LIGHTGREY;
+
+        char name[14];
+        strlcpy(name, names[i], sizeof(name));
+        padTo(name, 12, sizeof(name));
+
+        char aos[8];
+        fmtClock((time_t)p.aosUnix, tOffsetHours, aos, sizeof(aos));
+
+        char el[5];
+        snprintf(el, sizeof(el), "%2.0f", p.maxElDeg);
+
+        char dur[8];
+        fmtDuration((long)(p.losUnix - p.aosUnix), dur, sizeof(dur));
+
+        char az[10];
+        snprintf(az, sizeof(az), "%03.0f>%03.0f", p.aosAzDeg, p.losAzDeg);
+
+        tft.setTextColor(colour, TFT_BLACK);
+        tft.drawString(name, COL_NAME, y);
+        tft.drawString(aos,  COL_AOS,  y);
+        tft.drawString(el,   COL_EL,   y);
+        tft.drawString(dur,  COL_DUR,  y);
+        tft.drawString(az,   COL_AZ,   y);
+    }
+
+    if (shown == 0) {
+        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString(configured == 0 ? "No satellites configured."
+                                       : "No passes predicted yet.",
+                       COL_NAME, ROW0_Y);
+        tft.drawString("Open http://hamclock.local/sat.html", COL_NAME, ROW0_Y + 20);
+    }
+}
+
+static void drawFooter(TFT_eSPI &tft, time_t utc)
+{
+    char buf[56];
+    uint8_t bad = 0, count;
+    double oldestAgeH = -1.0;
+
+    SAT_LOCK();
+    count = g_slotCount;
+    for (uint8_t i = 0; i < g_slotCount; i++) {
+        if (!g_slots[i].recValid) { bad++; continue; }
+        if (g_slots[i].fetchedUnix && utc > (time_t)g_slots[i].fetchedUnix) {
+            double ageH = (double)(utc - (time_t)g_slots[i].fetchedUnix) / 3600.0;
+            if (ageH > oldestAgeH) oldestAgeH = ageH;
+        }
+    }
+    double lat = g_latDeg, lon = g_lonDeg, minEl = g_minElevation;
+    SAT_UNLOCK();
+
+    uint16_t colour = TFT_DARKGREY;
+    if (bad) {
+        snprintf(buf, sizeof(buf), "%u sat  %u WITHOUT TLE  min el %.0f", count, bad, minEl);
+        colour = TFT_RED;
+    } else if (oldestAgeH < 0.0) {
+        snprintf(buf, sizeof(buf), "%u sat  no TLE yet  min el %.0f", count, minEl);
+        colour = (count > 0) ? TFT_ORANGE : TFT_DARKGREY;
+    } else {
+        snprintf(buf, sizeof(buf), "%u sat  TLE %.0fh  %.2f%c %.2f%c  min el %.0f",
+                 count, oldestAgeH,
+                 fabs(lat), lat >= 0 ? 'N' : 'S',
+                 fabs(lon), lon >= 0 ? 'E' : 'W',
+                 minEl);
+        // TLEs go stale after about a week.
+        if (oldestAgeH > 168.0) colour = TFT_RED;
+        else if (oldestAgeH > 48.0) colour = TFT_ORANGE;
+    }
+
+    padTo(buf, 39, sizeof(buf));
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(colour, TFT_BLACK);
+    tft.drawString(buf, COL_NAME, FOOTER_Y);
+}
+
+void satellitesDrawPage(TFT_eSPI &tft, time_t utcNow, int tOffsetHours, bool fullRedraw)
+{
+    static uint32_t lastVersion = 0xFFFFFFFFu;
+    static time_t   lastSecond  = 0;
+    static time_t   lastTable   = 0;
+
+    if (fullRedraw) {
+        drawStaticFurniture(tft);
+        lastVersion = 0xFFFFFFFFu;
+        lastSecond  = 0;
+        lastTable   = 0;
+    }
+
+    bool versionChanged = (lastVersion != g_passVersion);
+    if (versionChanged || fullRedraw) {
+        drawTable(tft, utcNow, tOffsetHours, true);
+        lastVersion = g_passVersion;
+        lastTable   = utcNow;
+    } else if (utcNow - lastTable >= 15) {
+        // Refresh the row colours (imminent / in progress) without clearing.
+        drawTable(tft, utcNow, tOffsetHours, false);
+        lastTable = utcNow;
+    }
+
+    if (utcNow != lastSecond) {
+        drawHeaderClock(tft, utcNow, tOffsetHours);
+        drawBanner(tft, utcNow, tOffsetHours, fullRedraw);
+        drawFooter(tft, utcNow);
+        lastSecond = utcNow;
+    }
+}
+
+// =============================================================================
+// 8. Public entry points
+// =============================================================================
+
+void satellitesSelfTest()
+{
+    // Vallado's SGP4 verification case 5 - a wrong constant anywhere in the
+    // propagator shows up here as kilometres of error.
+    const char *l1 = "1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753";
+    const char *l2 = "2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667";
+
+    sgp4::SatRec s;
+    if (!sgp4::parseTle(l1, l2, s)) {
+        Serial.printf("🛰️ SGP4 selftest: parse FAILED (err %d)\n", s.error);
+        return;
+    }
+
+    struct { double t, x, y, z; } expect[] = {
+        {    0.0,  7022.46529266, -1400.08296755,     0.03995155},
+        {  720.0, -7134.59340119,  6531.68641334,  3260.27186483},
+        { 1440.0,  -938.55923943, -6268.18748831, -4294.02924751},
+    };
+
+    double worst = 0.0;
+    for (auto &e : expect) {
+        double r[3], v[3];
+        int err = 0;
+        if (!sgp4::propagate(s, e.t, r, v, &err)) {
+            Serial.printf("🛰️ SGP4 selftest: propagate FAILED at t=%.0f (err %d)\n", e.t, err);
+            return;
+        }
+        worst = fmax(worst, fabs(r[0] - e.x));
+        worst = fmax(worst, fabs(r[1] - e.y));
+        worst = fmax(worst, fabs(r[2] - e.z));
+    }
+
+    Serial.printf("🛰️ SGP4 selftest: worst position error %.2e km - %s\n",
+                  worst, (worst < 1.0e-4) ? "PASS" : "FAIL");
+}
+
+void satellitesBegin(double latitude, double longitude)
+{
+    ensureSync();
+
+    g_latDeg = latitude;
+    g_lonDeg = longitude;
+
+    memset(g_slots, 0, sizeof(g_slots));
+
+    satellitesSelfTest();
+    loadConfig();
+
+    // Low priority on core 0: the pass search is pure arithmetic and must never
+    // get in the way of the display or the web server on core 1.
+    xTaskCreatePinnedToCore(satPredictTask, "satpredict", 10240, NULL, 1, NULL, 0);
+
+    requestPrediction();
+}
+
+void satellitesSetSite(double latitude, double longitude)
+{
+    SAT_LOCK();
+    bool changed = (fabs(latitude - g_latDeg) > 1e-6) || (fabs(longitude - g_lonDeg) > 1e-6);
+    g_latDeg = latitude;
+    g_lonDeg = longitude;
+    SAT_UNLOCK();
+    if (changed) requestPrediction();
+}
+
+void satellitesLoop(time_t utcNow)
+{
+    g_nowUnix = utcNow;
+
+    if (utcNow < 1600000000L) return;         // wait for NTP
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    // At most one download every 3 s, so a full list is fetched over ~25 s
+    // without hammering Celestrak or blocking the clock for long.
+    static uint32_t lastAttemptMs = 0;
+    if (lastAttemptMs && (millis() - lastAttemptMs) < 3000) return;
+
+    int due = -1;
+    SAT_LOCK();
+    uint32_t refreshSecs = (uint32_t)g_tleRefreshHours * 3600u;
+    for (uint8_t i = 0; i < g_slotCount; i++) {
+        SatSlot &s = g_slots[i];
+        if (!s.norad) continue;
+        if ((uint32_t)utcNow < s.retryAfterUnix) continue;
+        bool stale = !s.tleLoaded || s.fetchedUnix == 0 ||
+                     ((uint32_t)utcNow - s.fetchedUnix) > refreshSecs;
+        if (stale) { due = i; break; }
+    }
+    SAT_UNLOCK();
+
+    if (due < 0) return;
+
+    lastAttemptMs = millis();
+    fetchTleFor((uint8_t)due, utcNow);
+}

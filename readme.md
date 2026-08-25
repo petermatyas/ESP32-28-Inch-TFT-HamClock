@@ -13,6 +13,7 @@ It shows **local and UTC time**, **HF/VHF band conditions**, **solar/geomagnetic
 - 📡 **Band condition indicators** — Good / Fair / Poor at a glance.  
 - 📶 **Easy Wi-Fi setup** — Captive portal AP **`HB9IIUSetup`** on first boot.  
 - 🌐 **Web interface** — Configure time labels, colors, banner speed, boot logo; upload custom splash.  
+- 🛰️ **Satellite passes** — Track satellites by NORAD id; next passes plus a live "above the horizon now" indicator.
 - 💤 **Screensaver mode** — Random pixel animation.  
 - 💾 **Persistent settings** — Stored as JSON in SPIFFS.  
 - 🔗 **OTA + mDNS** — Update over the air; reach it at **`http://hamclock.local`**.  
@@ -47,6 +48,29 @@ Use your browser to flash the latest build:
 3. After joining your network, access **`http://hamclock.local`**.  
 4. In the web UI, **add your OpenWeather API key**, choose colors, labels, banner speed, and (optionally) **upload a custom splash** image.  
 5. Done — the clock/propagation panels will update automatically.  
+
+---
+
+## 🛰️ Satellite Passes
+
+A dedicated display page (touch through to page 8) lists the next passes over your
+configured location and highlights any satellite that is above the horizon right now.
+
+1. Open **`http://hamclock.local/sat.html`** (also linked from the main settings page).
+2. Enter the **NORAD catalogue numbers** you want to follow — the ISS is `25544`.
+   Up to 8 satellites are supported. Preset buttons cover the common ham and weather birds.
+3. Set the minimum elevation, how many passes to show, and the prediction horizon.
+
+Element sets are downloaded from [Celestrak](https://celestrak.org), cached in SPIFFS and
+refreshed every 12 hours by default, so predictions survive a reboot and a short outage.
+All orbital mechanics run on the ESP32 — no API key and no per-pass network call.
+
+**On the display:** a green banner means the satellite is above your minimum elevation
+and workable right now. Rows in the pass table turn yellow within ten minutes of AOS.
+
+**Limitation:** only near-earth objects are supported (orbital period under 225 minutes).
+Geostationary and Molniya satellites need the deep-space SDP4 model, which this firmware
+does not implement — such an id is reported as unsupported rather than silently mispredicted.
 
 ---
 

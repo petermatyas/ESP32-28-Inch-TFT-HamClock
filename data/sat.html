@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Satellite Pass Configurator</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600&display=swap" rel="stylesheet">
+    <style>
+        body { background-color: #121212; color: #e0e0e0; }
+        .card { background-color: #1e1e1e; border: 1px solid #333; }
+        h1 { font-family: 'Orbitron', sans-serif; }
+
+        /* Section headings: white on the card, with a cyan rule so each block
+           is findable at a glance. */
+        .card-title {
+            font-family: 'Orbitron', sans-serif;
+            color: #ffffff;
+            font-size: 1.3rem;
+            letter-spacing: .04em;
+            padding-bottom: .5rem;
+            margin-bottom: 1.15rem;
+            border-bottom: 2px solid #0dcaf0;
+        }
+
+        /* Field labels: near-white and a touch larger. */
+        .form-label, .form-check-label {
+            color: #f2f5f8;
+            font-size: 1.02rem;
+            font-weight: 500;
+            margin-bottom: .4rem;
+        }
+
+        /* Bootstrap's .text-secondary is #6c757d, only 3.6:1 against the card
+           background.  #aab6c2 keeps it visibly secondary at 8:1. */
+        .text-secondary, .form-text { color: #aab6c2 !important; }
+        .form-text { font-size: .875rem; }
+        .badge-preset .text-white-50 { color: rgba(255, 255, 255, .85) !important; }
+
+        /* The stock outline-secondary text is so dim on black that the button
+           reads as disabled - keep it visually secondary, but legible. */
+        .btn-outline-secondary {
+            --bs-btn-color: #c9d3dd;
+            --bs-btn-border-color: #6c757d;
+            --bs-btn-hover-color: #ffffff;
+            --bs-btn-hover-bg: #6c757d;
+            --bs-btn-hover-border-color: #6c757d;
+        }
+
+        .form-control, .form-select { background-color: #2a2a2a; color: #f2f5f8; border-color: #5a5a5a; }
+        .form-control:focus, .form-select:focus { background-color: #2a2a2a; color: #fff; border-color: #0dcaf0; box-shadow: none; }
+        .form-control::placeholder { color: #8b96a1; }
+
+        /* The stock checkbox is nearly invisible against a dark card. */
+        .form-check-input { background-color: #2a2a2a; border-color: #6a6a6a; }
+        .form-check-input:checked { background-color: #0dcaf0; border-color: #0dcaf0; }
+        .form-check-input:focus { border-color: #0dcaf0; box-shadow: 0 0 0 .2rem rgba(13, 202, 240, .25); }
+
+        .sat-row { border-bottom: 1px solid #2a2a2a; padding: 8px 0; }
+        .sat-name { font-family: 'Courier New', monospace; }
+        .badge-preset { cursor: pointer; }
+        table.passes { font-family: 'Courier New', monospace; font-size: 0.9rem; }
+        table.passes td, table.passes th { padding: 3px 8px; }
+        .live { color: #00e676; font-weight: bold; }
+        .soon { color: #ffd54f; }
+        #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+                 z-index: 1080; display: none; }
+    </style>
+</head>
+<body>
+<div class="container py-4">
+
+    <h1 class="text-center mb-1">🛰️ Satellite Passes</h1>
+    <p class="text-center text-secondary">
+        Enter NORAD catalogue numbers. The clock downloads their element sets from
+        Celestrak and shows the next passes for your configured location on its own page.
+    </p>
+
+    <!-- ================= satellite list ================= -->
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Tracked satellites <span class="text-secondary" id="slotCount"></span></h5>
+
+                    <div id="satList"></div>
+
+                    <button class="btn btn-outline-info btn-sm mt-3" onclick="addRow('')">+ Add satellite</button>
+                    <button class="btn btn-outline-secondary btn-sm mt-3" onclick="refreshTle()">↻ Save &amp; re-download all TLEs</button>
+
+                    <hr class="border-secondary mt-4">
+                    <p class="mb-1 text-secondary small">
+                        Common satellites &mdash; click to add. The catalogue number is what counts;
+                        the clock reports back the name Celestrak returns, so a wrong number shows up
+                        straight away as an error in the list above.
+                    </p>
+                    <div id="presets"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= settings ================= -->
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Settings</h5>
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label class="form-label" for="minElevation">Minimum elevation (&deg;)</label>
+                            <input type="number" class="form-control" id="minElevation" min="0" max="60" step="1">
+                            <div class="form-text text-secondary">A pass counts once the satellite gets this high.</div>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label" for="maxShown">Passes shown on the display</label>
+                            <input type="number" class="form-control" id="maxShown" min="1" max="5" step="1">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label" for="horizonDays">Prediction horizon (days)</label>
+                            <input type="number" class="form-control" id="horizonDays" min="1" max="5" step="1">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label" for="tleRefreshHours">TLE refresh interval (hours)</label>
+                            <input type="number" class="form-control" id="tleRefreshHours" min="1" max="72" step="1">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label" for="altitudeM">Site altitude (m)</label>
+                            <input type="number" class="form-control" id="altitudeM" min="-400" max="9000" step="10">
+                        </div>
+                        <div class="col-md-4 d-flex align-items-end">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="useLocalTime">
+                                <label class="form-check-label" for="useLocalTime">Show local time (otherwise UTC)</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="alert alert-secondary mt-3 mb-0"
+                         style="background-color:#1a2733;color:#9ecbff;border:1px solid #24435c;">
+                        <strong>Location:</strong> <span id="siteInfo">&mdash;</span>.
+                        Change it on the <a href="/" class="link-info">main settings page</a>.
+                    </div>
+
+                    <button class="btn btn-info mt-3" onclick="save()">💾 Save</button>
+                    <span id="statusMsg" class="ms-3"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= predicted passes ================= -->
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Predicted passes <span class="text-secondary small" id="predAge"></span></h5>
+                    <div class="table-responsive">
+                        <table class="table table-dark table-sm passes mb-0" id="passTable">
+                            <thead>
+                                <tr>
+                                    <th>Satellite</th><th>AOS</th><th>Max el</th>
+                                    <th>Duration</th><th>Az start &rarr; end</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                    <p class="text-secondary small mt-2 mb-0">
+                        Times are shown in your browser's timezone here; the clock itself uses the
+                        setting above.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <p class="text-center text-secondary small">
+        Element sets from <a href="https://celestrak.org" target="_blank" class="link-secondary">Celestrak</a>.
+        Only near-earth objects (orbital period below 225 minutes) are supported &mdash;
+        geostationary and Molniya satellites need the deep-space model, which this firmware does not implement.
+    </p>
+</div>
+
+<div id="toast" class="alert alert-info"></div>
+
+<script>
+const PRESETS = [
+    { id: 25544, label: 'ISS (ZARYA)' },
+    { id: 25338, label: 'NOAA-15' },
+    { id: 28654, label: 'NOAA-18' },
+    { id: 33591, label: 'NOAA-19' },
+    { id: 27607, label: 'SO-50' },
+    { id: 43017, label: 'AO-91' },
+    { id: 44909, label: 'RS-44' },
+    { id: 7530,  label: 'AO-7' }
+];
+
+let cfg = null;
+let dirty = false;
+
+function markDirty() {
+    dirty = true;
+    document.getElementById('statusMsg').innerHTML =
+        '<span class="text-warning">Unsaved changes &mdash; press Save.</span>';
+}
+
+function clearDirty(msg) {
+    dirty = false;
+    document.getElementById('statusMsg').innerHTML = msg || '';
+}
+
+function toast(msg, kind) {
+    const t = document.getElementById('toast');
+    t.className = 'alert alert-' + (kind || 'info');
+    t.textContent = msg;
+    t.style.display = 'block';
+    clearTimeout(t._h);
+    t._h = setTimeout(() => { t.style.display = 'none'; }, 3000);
+}
+
+function renderPresets() {
+    document.getElementById('presets').innerHTML = PRESETS.map(p =>
+        `<span class="badge bg-secondary badge-preset me-2 mb-2" onclick="addRow(${p.id})">
+            ${p.label} <span class="text-white-50">${p.id}</span>
+         </span>`).join('');
+}
+
+function addRow(id, info) {
+    const list = document.getElementById('satList');
+    if (list.querySelectorAll('.sat-row').length >= (cfg ? cfg.maxSats : 8)) {
+        toast('Maximum number of satellites reached', 'warning');
+        return;
+    }
+    if (id && [...list.querySelectorAll('.norad')].some(i => i.value == id)) {
+        toast('That catalogue number is already in the list', 'warning');
+        return;
+    }
+
+    const div = document.createElement('div');
+    div.className = 'row sat-row align-items-center';
+    div.innerHTML = `
+        <div class="col-4 col-md-3">
+            <input type="number" class="form-control form-control-sm norad" placeholder="NORAD id" value="${id || ''}" oninput="markDirty()">
+        </div>
+        <div class="col-5 col-md-6 sat-name small"></div>
+        <div class="col-2 col-md-2 small text-secondary tleage"></div>
+        <div class="col-1 text-end">
+            <button class="btn btn-sm btn-outline-danger" onclick="this.closest('.sat-row').remove(); markDirty()">&times;</button>
+        </div>`;
+    list.appendChild(div);
+    if (info) paintRow(div, info);
+    return div;
+}
+
+function paintRow(div, info) {
+    const nameEl = div.querySelector('.sat-name');
+    const ageEl = div.querySelector('.tleage');
+
+    if (!info) {                       // empty input row
+        nameEl.innerHTML = '';
+        ageEl.textContent = '';
+        ageEl.className = 'col-2 col-md-2 small text-secondary';
+        return;
+    }
+    if (info.unsaved) {
+        nameEl.innerHTML = '<span class="text-warning">not on the clock yet &mdash; press Save</span>';
+        ageEl.textContent = '';
+        ageEl.className = 'col-2 col-md-2 small text-secondary';
+        return;
+    }
+
+    if (info.ok) {
+        nameEl.innerHTML = `<span class="text-success">${info.name}</span>
+                            <span class="text-secondary"> &mdash; ${info.status}</span>`;
+    } else {
+        nameEl.innerHTML = `<span class="text-danger">${info.status}</span>`;
+    }
+    ageEl.textContent = info.tleAgeH >= 0 ? `TLE ${info.tleAgeH.toFixed(1)} h old` : 'no TLE';
+    ageEl.className = 'col-2 col-md-2 small ' +
+                      (info.tleAgeH > 168 ? 'text-danger' : 'text-secondary');
+}
+
+// Full rebuild of the list.  Discards anything typed but not saved, so it is
+// only called on page load and straight after a successful save.
+function load() {
+    return fetch('/satellites').then(r => r.json()).then(c => {
+        cfg = c;
+        document.getElementById('minElevation').value = Math.round(c.minElevation);
+        document.getElementById('maxShown').value = c.maxShown;
+        document.getElementById('horizonDays').value = c.horizonDays;
+        document.getElementById('tleRefreshHours').value = c.tleRefreshHours;
+        document.getElementById('altitudeM').value = Math.round(c.altitudeM);
+        document.getElementById('useLocalTime').checked = !!c.useLocalTime;
+        document.getElementById('siteInfo').textContent =
+            `${c.latitude.toFixed(4)}, ${c.longitude.toFixed(4)}`;
+        document.getElementById('slotCount').textContent = `(${c.sats.length}/${c.maxSats})`;
+
+        document.getElementById('satList').innerHTML = '';
+        c.sats.forEach(s => addRow(s.norad, s));
+        if (c.sats.length === 0) addRow('');
+        clearDirty();
+    }).catch(() => toast('Could not read the configuration from the clock', 'danger'));
+}
+
+// Updates only the status cells, matching rows by the id in the input.  It never
+// rebuilds the list, so polling it cannot throw away a half-typed entry.
+function refreshStatus() {
+    return fetch('/satellites').then(r => r.json()).then(c => {
+        cfg = c;
+        document.getElementById('slotCount').textContent = `(${c.sats.length}/${c.maxSats})`;
+        document.querySelectorAll('.sat-row').forEach(div => {
+            const v = parseInt(div.querySelector('.norad').value, 10);
+            if (!Number.isFinite(v) || v <= 0) { paintRow(div, null); return; }
+            const info = c.sats.find(x => x.norad === v);
+            paintRow(div, info || { unsaved: true });
+        });
+    }).catch(() => {});
+}
+
+function save() {
+    const ids = [...document.querySelectorAll('.norad')]
+        .map(i => parseInt(i.value, 10))
+        .filter(v => Number.isFinite(v) && v > 0);
+
+    const body = {
+        minElevation: parseFloat(document.getElementById('minElevation').value) || 0,
+        maxShown: parseInt(document.getElementById('maxShown').value, 10) || 5,
+        horizonDays: parseInt(document.getElementById('horizonDays').value, 10) || 3,
+        tleRefreshHours: parseInt(document.getElementById('tleRefreshHours').value, 10) || 12,
+        altitudeM: parseFloat(document.getElementById('altitudeM').value) || 0,
+        useLocalTime: document.getElementById('useLocalTime').checked,
+        sats: ids
+    };
+
+    document.getElementById('statusMsg').innerHTML = '<span class="text-info">Saving…</span>';
+    return fetch('/satellites', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    }).then(r => r.json())
+      .then(() => load())
+      .then(() => {
+        clearDirty('<span class="text-success">Saved.</span>');
+        toast('Saved. The clock is downloading any new element sets.', 'success');
+    }).catch(() => {
+        document.getElementById('statusMsg').innerHTML = '<span class="text-danger">Failed.</span>';
+        toast('Save failed', 'danger');
+    });
+}
+
+// Saves before refreshing.  Without this, a satellite you had just typed in was
+// silently dropped when the list was redrawn, and the clock never heard about it.
+// The status poller then shows each element set arriving (one every 3 s).
+function refreshTle() {
+    save()
+        .then(() => fetch('/satrefresh'))
+        .then(() => toast('Re-downloading element sets…', 'info'))
+        .catch(() => toast('Refresh failed', 'danger'));
+}
+
+function fmtTime(unix) {
+    const d = new Date(unix * 1000);
+    return d.toLocaleString([], { month: 'short', day: '2-digit',
+                                  hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtDur(s) {
+    return Math.floor(s / 60) + ':' + String(Math.round(s % 60)).padStart(2, '0');
+}
+
+function loadPasses() {
+    fetch('/satpasses').then(r => r.json()).then(d => {
+        const tb = document.querySelector('#passTable tbody');
+        if (!d.passes.length) {
+            tb.innerHTML = '<tr><td colspan="5" class="text-secondary">No passes predicted yet.</td></tr>';
+            return;
+        }
+        const now = d.utc;
+        tb.innerHTML = d.passes.map(p => {
+            let cls = '', when = fmtTime(p.aos);
+            if (p.aos <= now && p.los >= now) { cls = 'live'; when = 'IN PROGRESS'; }
+            else if (p.aos - now < 600) { cls = 'soon'; }
+            return `<tr class="${cls}">
+                <td>${p.name}</td>
+                <td>${when}</td>
+                <td>${p.maxEl.toFixed(0)}&deg;</td>
+                <td>${fmtDur(p.los - p.aos)}</td>
+                <td>${Math.round(p.aosAz)}&deg; &rarr; ${Math.round(p.losAz)}&deg;</td>
+            </tr>`;
+        }).join('');
+    }).catch(() => {});
+}
+
+['minElevation', 'maxShown', 'horizonDays', 'tleRefreshHours', 'altitudeM', 'useLocalTime']
+    .forEach(id => document.getElementById(id).addEventListener('input', markDirty));
+
+renderPresets();
+load();
+loadPasses();
+setInterval(loadPasses, 5000);
+setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>
