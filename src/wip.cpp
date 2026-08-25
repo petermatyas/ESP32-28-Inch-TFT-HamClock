@@ -1717,6 +1717,46 @@ void handlePNGUpload()
     }
 }
 
+// Switch to `page` and queue whatever that page needs redrawn.  Shared by both
+// paging directions so the two cannot drift apart.
+static void activatePage(uint8_t page)
+{
+    activePage = page;
+    tft.fillScreen(TFT_BLACK);
+
+    switch (activePage)
+    {
+    case 1:
+        drawOrredrawStaticElements(); // 🖼️ Redraw Big Clock frames
+        break;
+    case 2:
+        redrawMainPropagationPage = true;
+        break;
+    case 3:
+        redrawSolarSummaryPage1 = true;
+        break;
+    case 4:
+        redrawSolarSummaryPage2 = true;
+        break;
+    case 5:
+        redrawSolarSummaryPage3 = true;
+        break;
+    case 6:
+        reDrawWiFiQualityPage = true;
+        break;
+    case 7:
+        LASTbigClockTimeStr = "";
+        for (int i = 0; i < 4; i++)
+        {
+            bigClockLastDigit[i] = ' ';
+        }
+        break;
+    case 8:
+        redrawSatellitePage = true;
+        break;
+    }
+}
+
 void handleTouchToRotatePage()
 {
     uint16_t x, y;
@@ -1730,47 +1770,18 @@ void handleTouchToRotatePage()
             wasTouching = true;
             lastTouchMs = now;
 
-            // rotate page
-            activePage = (activePage % MAX_PAGES) + 1;
-            Serial.printf("📄 Active page -> %u\n", activePage);
-            tft.fillScreen(TFT_BLACK);
-            if (activePage == 1)
-            {
-                drawOrredrawStaticElements(); // 🖼️ Redraw Big Clock frames
-            }
-            if (activePage == 2)
-            {
-                redrawMainPropagationPage = true;
-            }
-            if (activePage == 3)
-            {
-                redrawSolarSummaryPage1 = true;
-            }
-            if (activePage == 4)
-            {
-                redrawSolarSummaryPage2 = true;
-            }
-            if (activePage == 5)
-            {
-                redrawSolarSummaryPage3 = true;
-            }
-            if (activePage == 6)
-            {
-                reDrawWiFiQualityPage = true;
-            }
-            if (activePage == 8)
-            {
-                redrawSatellitePage = true;
-            }
-            if (activePage == 7)
-            {
-                LASTbigClockTimeStr = "";
-                for (int i = 0; i < 4; i++)
-                {
-                    bigClockLastDigit[i] = ' ';
-                }
-                tft.fillScreen(TFT_BLACK);
-            }
+            // Tap the right half to go forward, the left half to go back.
+            bool forward = (x >= tft.width() / 2);
+            uint8_t next = forward ? (activePage % MAX_PAGES) + 1
+                                   : (activePage + MAX_PAGES - 2) % MAX_PAGES + 1;
+
+            // The touch x is printed so a mirrored panel is obvious without a
+            // debug build: if a tap on the right reports a low x, swap
+            // TOUCH_RAW_X_MIN and TOUCH_RAW_X_MAX in platformio.ini.
+            Serial.printf("📄 Active page -> %u (touch x=%u, %s)\n",
+                          next, x, forward ? "forward" : "back");
+
+            activatePage(next);
         }
     }
     else
