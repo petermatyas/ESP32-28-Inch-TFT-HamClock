@@ -1,5 +1,8 @@
 
 #include <TFT_eSPI.h>
+#ifdef USE_XPT2046_SPI_TOUCH
+#include <XPT2046_Touchscreen.h>
+#endif
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <NTPClient.h>
@@ -162,6 +165,61 @@ TFT_eSprite scrollingText = TFT_eSprite(&tft); // Sprite object for "Hello World
 
 TFT_eSprite labelSprite = TFT_eSprite(&tft); // Global sprite
 
+// ---------------------------------------------------------------------------
+// Touch input
+// ---------------------------------------------------------------------------
+// On boards like the CYD (ESP32-2432S028R) the XPT2046 touch controller sits on
+// its own SPI bus, so TFT_eSPI's shared-bus getTouch() can never reach it and
+// always reports "not touched" (or worse, noise from a floating MISO line).
+// When USE_XPT2046_SPI_TOUCH is defined we drive the controller directly on a
+// second SPI port; otherwise we keep the original shared-bus behaviour.
+// Every touch call site goes through readTouchPoint() below.
+#ifdef USE_XPT2046_SPI_TOUCH
+
+// TFT_eSPI uses VSPI (no USE_HSPI_PORT), so the touch panel gets HSPI.
+SPIClass touchSPI(HSPI);
+XPT2046_Touchscreen touchPanel(TOUCH_XPT_CS, TOUCH_XPT_IRQ);
+
+static void initTouch()
+{
+    touchSPI.begin(TOUCH_XPT_SCLK, TOUCH_XPT_MISO, TOUCH_XPT_MOSI, TOUCH_XPT_CS);
+    touchPanel.begin(touchSPI);
+    touchPanel.setRotation(TOUCH_ROTATION);
+    Serial.println("XPT2046 touch initialized on its own SPI bus.");
+}
+
+// Returns screen coordinates in the display's current rotation, matching what
+// tft.getTouch() would have produced on a shared-bus panel.
+static bool readTouchPoint(uint16_t *x, uint16_t *y)
+{
+    if (!touchPanel.touched())
+        return false;
+
+    TS_Point p = touchPanel.getPoint();
+
+    long mx = map(p.x, TOUCH_RAW_X_MIN, TOUCH_RAW_X_MAX, 0, tft.width() - 1);
+    long my = map(p.y, TOUCH_RAW_Y_MIN, TOUCH_RAW_Y_MAX, 0, tft.height() - 1);
+
+    *x = (uint16_t)constrain(mx, 0, tft.width() - 1);
+    *y = (uint16_t)constrain(my, 0, tft.height() - 1);
+
+#ifdef TOUCH_DEBUG
+    Serial.printf("touch raw=%d,%d z=%d -> screen=%u,%u\n", p.x, p.y, p.z, *x, *y);
+#endif
+    return true;
+}
+
+#else // shared-bus touch handled by TFT_eSPI itself
+
+static void initTouch() {}
+
+static bool readTouchPoint(uint16_t *x, uint16_t *y)
+{
+    return tft.getTouch(x, y);
+}
+
+#endif
+
 // Scrolling Text
 int scrollingTextXposition;                                                                                                                        // Variable for text position (to start at the rightmost side)
 String scrollText = "Sorry, No Weather Info At This Moment!!!    Have you enterred your API key via the Web Interface at http://hamclock.local ?"; // Text to scroll
@@ -239,6 +297,8 @@ void setup()
     tft.fillScreen(TFT_BLACK);
     Serial.println("TFT Display initialized!");
     tft.setFreeFont(&digits60pt7b);
+
+    initTouch();
 
     checkIfscreenIsTouchedDuringStartUpForFactoryReset();
     // 🔧 Mount SPIFFS
@@ -725,7 +785,7 @@ void loop()
             lastDotUpdate = currentMillis;
         }
         uint16_t x, y;
-        if (tft.getTouch(&x, &y))
+        if (readTouchPoint(&x, &y))
         {
             Serial.println("🖐 Touch detected — exiting screensaver.");
             screenSaver = false;
@@ -1640,7 +1700,7 @@ void handlePNGUpload()
 void handleTouchToRotatePage()
 {
     uint16_t x, y;
-    bool touching = tft.getTouch(&x, &y);
+    bool touching = readTouchPoint(&x, &y);
     unsigned long now = millis();
 
     if (touching)
@@ -2559,7 +2619,7 @@ void checkIfscreenIsTouchedDuringStartUpForFactoryReset()
     while (millis() - screenScanTimeStart < 1000)
     {
         uint16_t x, y;
-        if (tft.getTouch(&x, &y))
+        if (readTouchPoint(&x, &y))
         {
             screenWasTouched = true;
             break;
@@ -2601,14 +2661,15 @@ void checkIfscreenIsTouchedDuringStartUpForFactoryReset()
     drawButton(BTN_X, BTN_Y1, "Proceed", TFT_GREEN, TFT_BLACK);
     drawButton(BTN_X, BTN_Y2, "Exit", TFT_RED, TFT_WHITE);
 
-    bool invertY = true; // set false if normal
+    // readTouchPoint() already returns coordinates in display orientation
+    bool invertY = false;
     bool invertX = false;
 
     // Modal loop
     while (true)
     {
         uint16_t x, y;
-        if (tft.getTouch(&x, &y))
+        if (readTouchPoint(&x, &y))
         {
             if (invertX)
                 x = tft.width() - x;

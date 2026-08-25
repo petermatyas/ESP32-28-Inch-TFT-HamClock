@@ -26,7 +26,7 @@ print(">>> extra_script.py loaded", flush=True)
 
 def pre_buildfs(source, target, env):
     print(">>> Building filesystem image (pio run -t buildfs)…", flush=True)
-    env.Execute("$PYTHONEXE -m platformio run -t buildfs")
+    env.Execute("$PYTHONEXE -m platformio run -e $PIOENV -t buildfs")
 
 def post_merge(source, target, env):
     print(f">>> Preparing merge for {FIRMWARE_NAME}.bin …", flush=True)
@@ -61,8 +61,11 @@ def post_merge(source, target, env):
         return
 
     # Build esptool merge command (sparse merged image)
+    # esptool.py is not on PATH - call the copy shipped with the espressif32 platform
+    esptool = os.path.join(env.PioPlatform().get_package_dir("tool-esptoolpy"), "esptool.py")
+    python  = env.subst("$PYTHONEXE")
     cmd = (
-        f"esptool.py --chip esp32 merge_bin -o {merged} "
+        f'"{python}" "{esptool}" --chip esp32 merge_bin -o {merged} '
         f"--flash_mode dio --flash_freq 80m --flash_size {FLASH_SIZE} "
         f"0x1000 {bootloader} "
         f"0x8000 {partitions} "
