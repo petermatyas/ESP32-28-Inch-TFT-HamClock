@@ -64,7 +64,6 @@ static bool     g_predictBusy = false;
 
 // configuration (defaults are used until /satellites.json exists)
 static double  g_minElevation    = 5.0;
-static uint8_t g_maxShown        = 5;
 static uint8_t g_horizonDays     = 3;
 static uint8_t g_tleRefreshHours = 12;
 static bool    g_useLocalTime    = true;
@@ -167,7 +166,6 @@ static void saveConfig()
 {
     JsonDocument doc;
     doc["minElevation"]    = g_minElevation;
-    doc["maxShown"]        = g_maxShown;
     doc["horizonDays"]     = g_horizonDays;
     doc["tleRefreshHours"] = g_tleRefreshHours;
     doc["useLocalTime"]    = g_useLocalTime;
@@ -203,14 +201,11 @@ static void loadConfig()
     }
 
     g_minElevation    = doc["minElevation"]    | g_minElevation;
-    g_maxShown        = doc["maxShown"]        | g_maxShown;
     g_horizonDays     = doc["horizonDays"]     | g_horizonDays;
     g_tleRefreshHours = doc["tleRefreshHours"] | g_tleRefreshHours;
     g_useLocalTime    = doc["useLocalTime"]    | g_useLocalTime;
     g_altitudeM       = doc["altitudeM"]       | g_altitudeM;
 
-    if (g_maxShown < 1) g_maxShown = 1;
-    if (g_maxShown > 5) g_maxShown = 5;
     if (g_horizonDays < 1) g_horizonDays = 1;
     if (g_horizonDays > 5) g_horizonDays = 5;
     if (g_tleRefreshHours < 1) g_tleRefreshHours = 1;
@@ -464,7 +459,6 @@ static void buildConfigJson(String &out)
 
     SAT_LOCK();
     doc["minElevation"]    = g_minElevation;
-    doc["maxShown"]        = g_maxShown;
     doc["horizonDays"]     = g_horizonDays;
     doc["tleRefreshHours"] = g_tleRefreshHours;
     doc["useLocalTime"]    = g_useLocalTime;
@@ -517,14 +511,11 @@ static void handleSaveSatellites(WebServer &server)
     oldCount = g_slotCount;
 
     g_minElevation    = doc["minElevation"]    | g_minElevation;
-    g_maxShown        = doc["maxShown"]        | g_maxShown;
     g_horizonDays     = doc["horizonDays"]     | g_horizonDays;
     g_tleRefreshHours = doc["tleRefreshHours"] | g_tleRefreshHours;
     g_useLocalTime    = doc["useLocalTime"]    | g_useLocalTime;
     g_altitudeM       = doc["altitudeM"]       | g_altitudeM;
 
-    if (g_maxShown < 1) g_maxShown = 1;
-    if (g_maxShown > 5) g_maxShown = 5;
     if (g_horizonDays < 1) g_horizonDays = 1;
     if (g_horizonDays > 5) g_horizonDays = 5;
     if (g_tleRefreshHours < 1) g_tleRefreshHours = 1;
@@ -625,22 +616,27 @@ void satellitesRegisterRoutes(WebServer &server)
 // 6. Live look angles
 // =============================================================================
 
+// How many satellites the banner can list at once.  Four still leaves three
+// rows for the prediction table underneath.
+#define SAT_BANNER_MAX 4
+
+// Upper bound on the rows the pass list can ever hold, for its scratch arrays.
+#define SAT_LIST_MAX 8
+
 struct SatLive {
-    bool     active;
-    uint8_t  slot;
-    double   elDeg, azDeg, rangeKm;
-    bool     haveLos;
-    double   losUnix;
-    double   maxElDeg;
+    uint8_t slot;
+    char    name[16];
+    double  elDeg, azDeg, rangeKm;
+    bool    haveLos;
+    double  losUnix;
+    double  maxElDeg;
 };
 
-// Highest satellite currently above the configured minimum elevation.
-static bool computeLive(time_t now, SatLive &out)
+// Every satellite currently above the configured minimum elevation, highest
+// first, capped at what the banner can show.  Returns how many were found.
+static uint8_t computeLive(time_t now, SatLive *out, uint8_t maxOut)
 {
-    out.active  = false;
-    out.haveLos = false;
-
-    double best = -1000.0;
+    uint8_t n = 0;
     double jd = sgp4::jdFromUnix((double)now);
 
     SAT_LOCK();
@@ -659,58 +655,90 @@ static bool computeLive(time_t now, SatLive &out)
 
         sgp4::Look look;
         sgp4::observe(r, v, jd, latRad, lonRad, altKm, look);
-        if (look.elDeg < minEl || look.elDeg <= best) continue;
+        if (look.elDeg < minEl) continue;
 
-        best        = look.elDeg;
-        out.active  = true;
-        out.slot    = i;
-        out.elDeg   = look.elDeg;
-        out.azDeg   = look.azDeg;
-        out.rangeKm = look.rangeKm;
+        SatLive entry;
+        entry.slot     = i;
+        entry.elDeg    = look.elDeg;
+        entry.azDeg    = look.azDeg;
+        entry.rangeKm  = look.rangeKm;
+        entry.haveLos  = false;
+        entry.losUnix  = 0.0;
+        entry.maxElDeg = look.elDeg;
+        strlcpy(entry.name, g_slots[i].name, sizeof(entry.name));
+
+        // Insertion sort by elevation, highest first; when full the lowest one
+        // falls off the end.
+        uint8_t pos = n;
+        while (pos > 0 && out[pos - 1].elDeg < entry.elDeg) pos--;
+        if (pos >= maxOut) continue;
+        for (uint8_t k = (n < maxOut ? n : (uint8_t)(maxOut - 1)); k > pos; k--)
+            out[k] = out[k - 1];
+        out[pos] = entry;
+        if (n < maxOut) n++;
     }
 
-    // Attach the LOS and culmination of the pass this satellite is in.
-    if (out.active) {
+    // Attach the LOS and culmination of the pass each one is inside.
+    for (uint8_t e = 0; e < n; e++) {
         for (uint8_t i = 0; i < g_passCount; i++) {
-            if (g_passes[i].slot != out.slot) continue;
+            if (g_passes[i].slot != out[e].slot) continue;
             if (g_passes[i].p.aosUnix - 60.0 <= (double)now &&
                 g_passes[i].p.losUnix >= (double)now) {
-                out.haveLos  = true;
-                out.losUnix  = g_passes[i].p.losUnix;
-                out.maxElDeg = g_passes[i].p.maxElDeg;
+                out[e].haveLos  = true;
+                out[e].losUnix  = g_passes[i].p.losUnix;
+                out[e].maxElDeg = g_passes[i].p.maxElDeg;
                 break;
             }
         }
     }
     SAT_UNLOCK();
-
-    return out.active;
+    return n;
 }
 
 // =============================================================================
 // 7. TFT page rendering
 // =============================================================================
 
-// Layout constants (320x240, rotation 3).  y values are the top of the text,
+// Fixed furniture (320x240, rotation 3).  y values are the top of the text,
 // which is what drawString() with TL_DATUM uses.
-static const int HDR_Y      = 2;
-static const int RULE1_Y    = 19;
-static const int BANNER_Y   = 22;
-static const int BANNER_H   = 46;
-static const int COLHDR_Y   = 74;
-static const int RULE2_Y    = 88;
-static const int ROW0_Y     = 94;
-static const int ROW_H      = 24;
-static const int TABLE_BOT  = 208;   // end of the table's clear region
-static const int FOOTER_Y   = 214;   // same 24 px pitch as the rows above
-
-static int g_footerMode = -1;   // -1 unknown, 0 status message, 1 pass row
+static const int HDR_Y         = 2;
+static const int RULE1_Y       = 19;
+static const int BANNER_Y      = 22;
+static const int BANNER_LINE_H = 18;
+static const int BANNER_PAD    = 8;
+static const int BANNER_MAX_H  = BANNER_PAD + SAT_BANNER_MAX * BANNER_LINE_H;
+static const int ROW_H         = 24;
+static const int LIST_BOTTOM   = 232;   // last row's text must end by here
 
 static const int COL_NAME = 6;
 static const int COL_AOS  = 112;
 static const int COL_EL   = 170;
 static const int COL_DUR  = 205;
 static const int COL_AZ   = 252;
+
+// The banner reuses the list's x positions, so the columns line up all the way
+// down the screen even though the two carry different fields.
+static const int BCOL_NAME = COL_NAME;   // satellite
+static const int BCOL_EL   = COL_AOS;    // elevation now
+static const int BCOL_AZ   = COL_EL;     // azimuth now
+static const int BCOL_LOS  = COL_AZ;     // how much longer it stays up
+
+// The banner grows with the number of satellites overhead, so everything below
+// it is positioned relative to that.
+static int bannerHeight(uint8_t lines) { return BANNER_PAD + lines * BANNER_LINE_H; }
+static int colHdrY(uint8_t lines)      { return BANNER_Y + bannerHeight(lines) + 6; }
+static int rule2Y(uint8_t lines)       { return colHdrY(lines) + 14; }
+static int row0Y(uint8_t lines)        { return rule2Y(lines) + 6; }
+
+// As many rows as physically fit under the banner - the list is not capped by
+// a setting, it simply fills the screen.
+static uint8_t tableCapacity(uint8_t lines)
+{
+    int avail = LIST_BOTTOM - 10 - row0Y(lines);
+    if (avail < 0) return 0;
+    uint8_t rows = (uint8_t)(avail / ROW_H + 1);
+    return rows > SAT_LIST_MAX ? SAT_LIST_MAX : rows;
+}
 
 static const char *compass16(double az)
 {
@@ -730,7 +758,7 @@ static void fmtClock(time_t utc, int tOffsetHours, char *out, size_t n)
     snprintf(out, n, "%02d:%02d", tm_.tm_hour, tm_.tm_min);
 }
 
-// "in 4d" / "01:23:45" / "04:12"
+// "4d23h" / "1:23:45" / "04:12"
 static void fmtCountdown(long secs, char *out, size_t n)
 {
     if (secs < 0) secs = 0;
@@ -753,38 +781,16 @@ static void padTo(char *s, size_t width, size_t bufLen)
     s[len] = '\0';
 }
 
-static void drawStaticFurniture(TFT_eSPI &tft)
-{
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(TL_DATUM);
-
-    tft.setFreeFont(&Orbitron_Medium8pt7b);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString("SATELLITES", COL_NAME, HDR_Y);
-
-    tft.drawFastHLine(4, RULE1_Y, 312, TFT_DARKGREY);
-
-    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("SAT", COL_NAME, COLHDR_Y);
-    tft.drawString("AOS", COL_AOS,  COLHDR_Y);
-    tft.drawString("EL",  COL_EL,   COLHDR_Y);
-    tft.drawString("DUR", COL_DUR,  COLHDR_Y);
-    tft.drawString("AZ",  COL_AZ,   COLHDR_Y);
-
-    tft.drawFastHLine(4, RULE2_Y, 312, TFT_DARKGREY);
-}
-
 // "TLE 6h" / "TLE 5d" / "no TLE" for the oldest element set on file.
 static void tleHealth(time_t utc, char *out, size_t n, uint16_t *colour)
 {
     double oldestAgeH = -1.0;
-    uint8_t count;
+    uint8_t count, bad = 0;
 
     SAT_LOCK();
     count = g_slotCount;
     for (uint8_t i = 0; i < g_slotCount; i++) {
-        if (!g_slots[i].recValid) continue;
+        if (!g_slots[i].recValid) { bad++; continue; }
         if (g_slots[i].fetchedUnix && utc > (time_t)g_slots[i].fetchedUnix) {
             double ageH = (double)(utc - (time_t)g_slots[i].fetchedUnix) / 3600.0;
             if (ageH > oldestAgeH) oldestAgeH = ageH;
@@ -793,23 +799,34 @@ static void tleHealth(time_t utc, char *out, size_t n, uint16_t *colour)
     SAT_UNLOCK();
 
     *colour = TFT_DARKGREY;
-    if (oldestAgeH < 0.0) {
-        snprintf(out, n, "%-8s", count ? "no TLE" : "");
+    char tmp[12];
+    if (bad) {
+        // The bottom status line is gone, so the warning lives here now.
+        snprintf(tmp, sizeof(tmp), "%u NO TLE", bad);
+        *colour = TFT_RED;
+    } else if (oldestAgeH < 0.0) {
+        snprintf(tmp, sizeof(tmp), "%s", count ? "no TLE" : "");
         if (count) *colour = TFT_ORANGE;
     } else if (oldestAgeH < 99.0) {
-        snprintf(out, n, "%-8s", "");
-        char tmp[12];
         snprintf(tmp, sizeof(tmp), "TLE %.0fh", oldestAgeH);
-        snprintf(out, n, "%-8s", tmp);
         // TLEs go stale after about a week.
         if (oldestAgeH > 48.0) *colour = TFT_ORANGE;
     } else {
         // Days, so a badly stale set cannot widen the field past its slot.
-        char tmp[12];
         snprintf(tmp, sizeof(tmp), "TLE %.0fd", oldestAgeH / 24.0);
-        snprintf(out, n, "%-8s", tmp);
         *colour = (oldestAgeH > 168.0) ? TFT_RED : TFT_ORANGE;
     }
+    snprintf(out, n, "%-8s", tmp);
+}
+
+// Page title and the rule under it - the only furniture that never moves.
+static void drawPageHeader(TFT_eSPI &tft)
+{
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&Orbitron_Medium8pt7b);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("SATELLITES", COL_NAME, HDR_Y);
+    tft.drawFastHLine(4, RULE1_Y, 312, TFT_DARKGREY);
 }
 
 static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
@@ -828,8 +845,6 @@ static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
     tft.drawString(buf, 314, HDR_Y + 2);
     tft.setTextDatum(TL_DATUM);
 
-    // Element-set age sits between the title and the clock; the bottom line is
-    // needed for a pass row now.
     char tle[12];
     uint16_t tleColour;
     tleHealth(utc, tle, sizeof(tle), &tleColour);
@@ -837,59 +852,26 @@ static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
     tft.drawString(tle, 146, HDR_Y + 2);
 }
 
-static void drawBanner(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool force)
+static void drawBannerFrame(TFT_eSPI &tft, uint8_t lines, bool anyLive)
 {
-    static int lastState = -1;   // 0 idle, 1 pass in progress
+    tft.drawRoundRect(2, BANNER_Y, 316, bannerHeight(lines), 6,
+                      anyLive ? TFT_GREEN : TFT_DARKGREY);
+}
 
-    SatLive live;
-    computeLive(utc, live);
+// One line per satellite that is workable right now.
+static void drawBannerLines(TFT_eSPI &tft, const SatLive *live, uint8_t n, time_t utc)
+{
+    char line[56];
 
-    int state = live.active ? 1 : 0;
-    uint16_t frame = live.active ? TFT_GREEN : TFT_DARKGREY;
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
 
-    if (force || state != lastState) {
-        tft.fillRect(3, BANNER_Y + 1, 314, BANNER_H - 2, TFT_BLACK);
-        tft.drawRoundRect(2, BANNER_Y, 316, BANNER_H, 6, frame);
-        lastState = state;
-    }
-
-    char line1[32], line2[48];
-    uint16_t colour;
-
-    if (live.active) {
-        char nm[19];
-        SAT_LOCK();
-        strlcpy(nm, g_slots[live.slot].name, sizeof(nm));
-        SAT_UNLOCK();
-
-        snprintf(line1, sizeof(line1), "NOW %s", nm);
-        padTo(line1, 22, sizeof(line1));
-        colour = TFT_GREEN;
-
-        char los[16];
-        if (live.haveLos) {
-            fmtCountdown((long)(live.losUnix - (double)utc), los, sizeof(los));
-            snprintf(line2, sizeof(line2), "EL %2.0f  AZ %3.0f %-3s  MAX %2.0f  LOS %s",
-                     live.elDeg, live.azDeg, compass16(live.azDeg),
-                     live.maxElDeg, los);
-        } else {
-            snprintf(line2, sizeof(line2), "EL %2.0f  AZ %3.0f %-3s  %.0f km",
-                     live.elDeg, live.azDeg, compass16(live.azDeg), live.rangeKm);
-        }
-    } else {
-        colour = TFT_DARKGREY;
-        strlcpy(line1, "NO PASS IN PROGRESS", sizeof(line1));
-        padTo(line1, 22, sizeof(line1));
-
-        // Next AOS from the predicted timeline.
+    if (n == 0) {
+        double aos = 0.0;
         bool found = false;
-        char nm[19] = {0};
-        double aos = 0;
         SAT_LOCK();
-        uint8_t slots = g_slotCount;
         for (uint8_t i = 0; i < g_passCount; i++) {
             if (g_passes[i].p.aosUnix > (double)utc) {
-                strlcpy(nm, g_slots[g_passes[i].slot].name, sizeof(nm));
                 aos = g_passes[i].p.aosUnix;
                 found = true;
                 break;
@@ -900,35 +882,68 @@ static void drawBanner(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool force)
         if (found) {
             char cd[16];
             fmtCountdown((long)(aos - (double)utc), cd, sizeof(cd));
-            snprintf(line2, sizeof(line2), "Next %s in %s", nm, cd);
-        } else if (slots == 0) {
-            snprintf(line2, sizeof(line2), "Add NORAD ids on /sat.html");
+            snprintf(line, sizeof(line), "NO PASS IN PROGRESS  AOS in %s", cd);
         } else {
-            snprintf(line2, sizeof(line2), "%s",
-                     g_predictBusy ? "Predicting..." : "No pass inside the horizon");
+            snprintf(line, sizeof(line), "NO PASS IN PROGRESS");
         }
+        padTo(line, 38, sizeof(line));
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString(line, BCOL_NAME, BANNER_Y + 5);
+        return;
     }
 
-    padTo(line2, 38, sizeof(line2));
+    for (uint8_t i = 0; i < n; i++) {
+        // Every field is fixed width, so the opaque text overwrites the
+        // previous value without needing the row cleared first.
+        char name[14];
+        strlcpy(name, live[i].name, sizeof(name));
+        padTo(name, 12, sizeof(name));
 
+        char el[6];
+        snprintf(el, sizeof(el), "%2.0f", live[i].elDeg);
+
+        char az[12];
+        snprintf(az, sizeof(az), "%03.0f %-3s", live[i].azDeg, compass16(live[i].azDeg));
+
+        char los[12];
+        if (live[i].haveLos) {
+            char cd[16];
+            fmtCountdown((long)(live[i].losUnix - (double)utc), cd, sizeof(cd));
+            snprintf(los, sizeof(los), "%-7s", cd);
+        } else {
+            snprintf(los, sizeof(los), "%-7s", "--:--");
+        }
+
+        int y = BANNER_Y + 5 + i * BANNER_LINE_H;
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.drawString(name, BCOL_NAME, y);
+        tft.drawString(el,   BCOL_EL,   y);
+        tft.drawString(az,   BCOL_AZ,   y);
+        tft.drawString(los,  BCOL_LOS,  y);
+    }
+}
+
+static void drawTableFurniture(TFT_eSPI &tft, uint8_t lines)
+{
     tft.setTextDatum(TL_DATUM);
-    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-    tft.setTextColor(colour, TFT_BLACK);
-    tft.drawString(line1, 10, BANNER_Y + 5);
-
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(colour, TFT_BLACK);
-    tft.drawString(line2, 10, BANNER_Y + 28);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+
+    int y = colHdrY(lines);
+    tft.drawString("SAT", COL_NAME, y);
+    tft.drawString("AOS", COL_AOS,  y);
+    tft.drawString("EL",  COL_EL,   y);
+    tft.drawString("DUR", COL_DUR,  y);
+    tft.drawString("AZ",  COL_AZ,   y);
+
+    tft.drawFastHLine(4, rule2Y(lines), 312, TFT_DARKGREY);
 }
 
 // One line of the pass list.  Used both for the table and for the bottom row.
 static void drawPassRow(TFT_eSPI &tft, int y, const char *satName,
                         const sgp4::Pass &p, time_t utc, int tOffsetHours)
 {
-    uint16_t colour;
-    if (p.aosUnix <= (double)utc)             colour = TFT_GREEN;
-    else if (p.aosUnix - (double)utc < 600.0) colour = TFT_YELLOW;
-    else                                      colour = TFT_LIGHTGREY;
+    uint16_t colour = (p.aosUnix - (double)utc < 600.0) ? TFT_YELLOW : TFT_LIGHTGREY;
 
     char name[14];
     strlcpy(name, satName, sizeof(name));
@@ -956,38 +971,45 @@ static void drawPassRow(TFT_eSPI &tft, int y, const char *satName,
     tft.drawString(az,   COL_AZ,   y);
 }
 
-static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool clearFirst)
+// True when this pass is already running and its satellite is on the banner, in
+// which case the table must not repeat it.
+static bool shownOnBanner(const PassRow &row, time_t utc, uint16_t bannerMask)
 {
+    return row.p.aosUnix <= (double)utc &&
+           (bannerMask & ((uint16_t)1 << row.slot)) != 0;
+}
+
+static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours,
+                      uint8_t lines, uint16_t bannerMask, bool clearFirst)
+{
+    const int first = row0Y(lines);
+    const uint8_t capacity = tableCapacity(lines);
+
     if (clearFirst)
-        tft.fillRect(0, RULE2_Y + 1, 320, TABLE_BOT - RULE2_Y - 1, TFT_BLACK);
+        tft.fillRect(0, rule2Y(lines) + 1, 320, 240 - rule2Y(lines) - 1, TFT_BLACK);
 
-    tft.setTextDatum(TL_DATUM);
-    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
-
-    PassRow rows[5];
+    PassRow rows[SAT_LIST_MAX];
+    char    names[SAT_LIST_MAX][14];
     uint8_t shown = 0;
     uint8_t configured;
-    char names[5][14];
 
     SAT_LOCK();
     configured = g_slotCount;
-    uint8_t limit = g_maxShown > 5 ? 5 : g_maxShown;
-    for (uint8_t i = 0; i < g_passCount && shown < limit; i++) {
-        if (g_passes[i].p.losUnix < (double)utc) continue;   // already over
+    for (uint8_t i = 0; i < g_passCount && shown < capacity; i++) {
+        if (g_passes[i].p.losUnix < (double)utc) continue;              // already over
+        if (shownOnBanner(g_passes[i], utc, bannerMask)) continue;      // on the banner
         rows[shown] = g_passes[i];
         strlcpy(names[shown], g_slots[g_passes[i].slot].name, sizeof(names[shown]));
         shown++;
     }
     SAT_UNLOCK();
 
-    for (uint8_t i = 0; i < 5; i++) {
-        int y = ROW0_Y + i * ROW_H;
-
+    for (uint8_t i = 0; i < capacity; i++) {
+        int y = first + i * ROW_H;
         if (i >= shown) {
             tft.fillRect(0, y - 2, 320, ROW_H, TFT_BLACK);
             continue;
         }
-
         drawPassRow(tft, y, names[i], rows[i].p, utc, tOffsetHours);
     }
 
@@ -995,76 +1017,11 @@ static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool clearFir
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.drawString(configured == 0 ? "No satellites configured."
-                                       : "No passes predicted yet.",
-                       COL_NAME, ROW0_Y);
-        tft.drawString("Open http://hamclock.local/sat.html", COL_NAME, ROW0_Y + 20);
+                                       : "No further passes predicted.",
+                       COL_NAME, first);
+        if (configured == 0)
+            tft.drawString("Open http://hamclock.local/sat.html", COL_NAME, first + 20);
     }
-}
-
-// Bottom line: the satellite to get ready for on the left, element set health
-// right-aligned on the right.  At 8 px per character the row holds 39 columns,
-// so the two halves are budgeted rather than concatenated.
-static void drawFooter(TFT_eSPI &tft, time_t utc, int tOffsetHours)
-{
-    char left[48];
-    uint8_t bad = 0, count;
-
-    char       nextName[16] = {0};
-    sgp4::Pass nextPass;
-    bool       haveNext = false;
-
-    SAT_LOCK();
-    count = g_slotCount;
-    for (uint8_t i = 0; i < g_slotCount; i++)
-        if (!g_slots[i].recValid) bad++;
-
-    // The table above already lists the first `limit` live passes, so repeating
-    // its top row here would waste the line.  Skip past what is on screen and
-    // show the next prediction after it.
-    uint8_t limit = g_maxShown > 5 ? 5 : g_maxShown;
-    uint8_t listed = 0;
-    for (uint8_t i = 0; i < g_passCount; i++) {
-        if (g_passes[i].p.losUnix < (double)utc) continue;   // already over
-        if (listed++ < limit) continue;                      // visible in the table
-        strlcpy(nextName, g_slots[g_passes[i].slot].name, sizeof(nextName));
-        nextPass = g_passes[i].p;
-        haveNext = true;
-        break;
-    }
-    uint8_t predicted = listed;
-    SAT_UNLOCK();
-
-    // The row form and the message form occupy different pixels, so wipe the
-    // strip when switching between them rather than every second.
-    int mode = (bad == 0 && haveNext) ? 1 : 0;
-    if (mode != g_footerMode) {
-        tft.fillRect(0, FOOTER_Y - 2, 320, 18, TFT_BLACK);
-        g_footerMode = mode;
-    }
-
-    if (mode == 1) {
-        drawPassRow(tft, FOOTER_Y, nextName, nextPass, utc, tOffsetHours);
-        return;
-    }
-
-    uint16_t colour = TFT_DARKGREY;
-    if (bad) {
-        snprintf(left, sizeof(left), "%u sat  %u WITHOUT TLE", count, bad);
-        colour = TFT_RED;
-    } else if (count == 0) {
-        snprintf(left, sizeof(left), "No satellites configured");
-    } else if (predicted > 0) {
-        snprintf(left, sizeof(left), "%u sat  %u pass%s predicted",
-                 count, predicted, predicted == 1 ? "" : "es");
-    } else {
-        snprintf(left, sizeof(left), "%u sat  no upcoming pass", count);
-    }
-    padTo(left, 38, sizeof(left));
-
-    tft.setTextDatum(TL_DATUM);
-    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(colour, TFT_BLACK);
-    tft.drawString(left, COL_NAME, FOOTER_Y);
 }
 
 void satellitesDrawPage(TFT_eSPI &tft, time_t utcNow, int tOffsetHours, bool fullRedraw)
@@ -1072,30 +1029,47 @@ void satellitesDrawPage(TFT_eSPI &tft, time_t utcNow, int tOffsetHours, bool ful
     static uint32_t lastVersion = 0xFFFFFFFFu;
     static time_t   lastSecond  = 0;
     static time_t   lastTable   = 0;
+    static uint8_t  lastLines   = 0xFF;
+
+    SatLive live[SAT_BANNER_MAX];
+    uint8_t nLive = computeLive(utcNow, live, SAT_BANNER_MAX);
+    uint8_t lines = nLive ? nLive : 1;
+
+    uint16_t bannerMask = 0;
+    for (uint8_t i = 0; i < nLive; i++)
+        bannerMask |= (uint16_t)1 << live[i].slot;
+
+    // A change in how many satellites are overhead resizes the banner, which
+    // moves everything below it.
+    bool relayout = fullRedraw || (lines != lastLines);
 
     if (fullRedraw) {
-        drawStaticFurniture(tft);
-        g_footerMode = -1;
-        lastVersion = 0xFFFFFFFFu;
-        lastSecond  = 0;
-        lastTable   = 0;
+        tft.fillScreen(TFT_BLACK);
+        drawPageHeader(tft);
     }
 
-    bool versionChanged = (lastVersion != g_passVersion);
-    if (versionChanged || fullRedraw) {
-        drawTable(tft, utcNow, tOffsetHours, true);
+    if (relayout) {
+        tft.fillRect(0, BANNER_Y, 320, 240 - BANNER_Y, TFT_BLACK);
+        drawBannerFrame(tft, lines, nLive > 0);
+        drawTableFurniture(tft, lines);
+        lastLines   = lines;
+        lastVersion = 0xFFFFFFFFu;
+        lastSecond  = 0;
+    }
+
+    if (lastVersion != g_passVersion || relayout) {
+        drawTable(tft, utcNow, tOffsetHours, lines, bannerMask, true);
         lastVersion = g_passVersion;
         lastTable   = utcNow;
     } else if (utcNow - lastTable >= 15) {
-        // Refresh the row colours (imminent / in progress) without clearing.
-        drawTable(tft, utcNow, tOffsetHours, false);
+        // Refresh the row colours (imminent) without clearing.
+        drawTable(tft, utcNow, tOffsetHours, lines, bannerMask, false);
         lastTable = utcNow;
     }
 
     if (utcNow != lastSecond) {
         drawHeaderClock(tft, utcNow, tOffsetHours);
-        drawBanner(tft, utcNow, tOffsetHours, fullRedraw);
-        drawFooter(tft, utcNow, tOffsetHours);
+        drawBannerLines(tft, live, nLive, utcNow);
         lastSecond = utcNow;
     }
 }

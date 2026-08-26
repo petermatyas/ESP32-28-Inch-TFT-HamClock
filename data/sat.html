@@ -113,10 +113,6 @@
                             <div class="form-text text-secondary">A pass counts once the satellite gets this high.</div>
                         </div>
                         <div class="col-md-4">
-                            <label class="form-label" for="maxShown">Passes shown on the display</label>
-                            <input type="number" class="form-control" id="maxShown" min="1" max="5" step="1">
-                        </div>
-                        <div class="col-md-4">
                             <label class="form-label" for="horizonDays">Prediction horizon (days)</label>
                             <input type="number" class="form-control" id="horizonDays" min="1" max="5" step="1">
                         </div>
@@ -287,7 +283,6 @@ function load() {
     return fetch('/satellites').then(r => r.json()).then(c => {
         cfg = c;
         document.getElementById('minElevation').value = Math.round(c.minElevation);
-        document.getElementById('maxShown').value = c.maxShown;
         document.getElementById('horizonDays').value = c.horizonDays;
         document.getElementById('tleRefreshHours').value = c.tleRefreshHours;
         document.getElementById('altitudeM').value = Math.round(c.altitudeM);
@@ -325,7 +320,6 @@ function save() {
 
     const body = {
         minElevation: parseFloat(document.getElementById('minElevation').value) || 0,
-        maxShown: parseInt(document.getElementById('maxShown').value, 10) || 5,
         horizonDays: parseInt(document.getElementById('horizonDays').value, 10) || 3,
         tleRefreshHours: parseInt(document.getElementById('tleRefreshHours').value, 10) || 12,
         altitudeM: parseFloat(document.getElementById('altitudeM').value) || 0,
@@ -392,7 +386,7 @@ function loadPasses() {
     }).catch(() => {});
 }
 
-['minElevation', 'maxShown', 'horizonDays', 'tleRefreshHours', 'altitudeM', 'useLocalTime']
+['minElevation', 'horizonDays', 'tleRefreshHours', 'altitudeM', 'useLocalTime']
     .forEach(id => document.getElementById(id).addEventListener('input', markDirty));
 
 renderPresets();
