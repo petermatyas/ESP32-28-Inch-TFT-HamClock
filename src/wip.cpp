@@ -51,7 +51,7 @@ int tOffset = 0; // will be updated via configuration device time (Iphone) and l
 Preferences prefs;
 // --- globals ---
 uint8_t activePage = 1;
-const uint8_t MAX_PAGES = 8;
+const uint8_t MAX_PAGES = 9;
 unsigned long lastTouchMs = 0;
 bool wasTouching = false;
 int scanCount = 0;
@@ -148,6 +148,25 @@ bool redrawSolarSummaryPage2 = true;
 bool redrawSolarSummaryPage3 = true;
 bool reDrawWiFiQualityPage = true;
 bool redrawSatellitePage = true;
+bool redrawWeatherPage = true;
+
+// fetchWeatherData() used to parse the OpenWeather response into locals and
+// throw everything away except the scrolling banner; the weather page needs the
+// values to stick around.
+struct WeatherInfo
+{
+    bool  valid = false;
+    char  city[32] = {0};
+    char  country[6] = {0};
+    char  description[40] = {0};
+    float temp = 0, feelsLike = 0, tempMin = 0, tempMax = 0;
+    int   pressure = 0, humidity = 0, clouds = 0, visibility = 0;
+    float windSpeed = 0, windGust = 0, rain1h = 0;
+    int   windDeg = 0;
+    long  sunrise = 0, sunset = 0;
+    long  fetchedUnix = 0;
+};
+WeatherInfo weather;
 
 // Relative x-offsets for HB97DIGITS12pt7b font layout
 const int xOffsets[8] = {
@@ -259,6 +278,8 @@ void drawSolarSummaryPage1();
 void drawSolarSummaryPage2();
 void drawSolarSummaryPage3();
 void drawWiFiQualityPage();
+void drawWeatherPage();
+void updateWeatherPageClock();
 void redrawdrawMainPropagationPagePage1();
 void fetchSolarData();
 void drawLOCALTime(const String &timeStr, int x, int y, uint16_t digitColor, uint16_t backgroundColor, bool blinkColon);
@@ -729,6 +750,7 @@ void loop()
     static unsigned long previousMillisForLargeClockUpdate = 0;
     static unsigned long previousMillisForPropagationClockUpdate = 0;
     static unsigned long previousMillisForWiFiPageUpdate = 0;
+    static unsigned long previousMillisForWeatherPageUpdate = 0;
     static unsigned long previousMillisForScroller = 0;
     static unsigned long previousMillisForAutoPageChanger = 0;
     static unsigned long previousMillisForTimeClientUpdate = 0;
@@ -753,6 +775,7 @@ void loop()
         Serial.println("Getting fresh weather data");
 
         fetchWeatherData();
+        redrawWeatherPage = true;
     }
     // 🌤️ Refresh propagation data every 5 minutes
     if (currentMillis - previousMillisForPropagationDataUpdate >= 1000UL * 60 * 5)
@@ -985,6 +1008,21 @@ void loop()
             redrawSatellitePage = false;
             break;
         }
+
+        case 9:
+        {
+            if (redrawWeatherPage)
+            {
+                drawWeatherPage();
+                redrawWeatherPage = false;
+            }
+            if (currentMillis - previousMillisForWeatherPageUpdate >= 1000)
+            {
+                previousMillisForWeatherPageUpdate = currentMillis;
+                updateWeatherPageClock();
+            }
+            break;
+        }
         }
 
     if (autoPageChange)
@@ -1178,6 +1216,29 @@ void fetchWeatherData()
         Serial.print("Status code: ");
         Serial.println(cod);
 
+        // Keep what the weather page needs.
+        strlcpy(weather.city, name ? name : "?", sizeof(weather.city));
+        strlcpy(weather.country, sys_country ? sys_country : "", sizeof(weather.country));
+        strlcpy(weather.description, weatherDescription ? weatherDescription : "",
+                sizeof(weather.description));
+        weather.temp        = temp;
+        weather.feelsLike   = feels_like;
+        weather.tempMin     = temp_min;
+        weather.tempMax     = temp_max;
+        weather.pressure    = pressure;
+        weather.humidity    = humidity;
+        weather.clouds      = clouds_all;
+        weather.visibility  = visibility;
+        weather.windSpeed   = wind_speed;
+        weather.windGust    = wind_gust;
+        weather.windDeg     = wind_deg;
+        weather.rain1h      = rain_1h;
+        weather.sunrise     = sunrise;
+        weather.sunset      = sunset;
+        weather.fetchedUnix = timeClient.getEpochTime();
+        weather.valid       = true;
+        redrawWeatherPage   = true;
+
         // Convert sunrise and sunset times to local time
         long localSunrise = sunrise + (tOffset * 3600); // Adjust for local time (seconds)
         long localSunset = sunset + (tOffset * 3600);   // Adjust for local time (seconds)
@@ -1208,6 +1269,8 @@ void fetchWeatherData()
         scrollText = "Sorry, No Weather Info At This Moment!!!            Have you enterred your API key?"; // Text to scroll
         scrollingTextXposition = scrollingText.width();
         APIkeyIsValid = false;
+        weather.valid = false;
+        redrawWeatherPage = true;
     }
 
     http.end();
@@ -1753,6 +1816,9 @@ static void activatePage(uint8_t page)
         break;
     case 8:
         redrawSatellitePage = true;
+        break;
+    case 9:
+        redrawWeatherPage = true;
         break;
     }
 }
@@ -2452,6 +2518,207 @@ void drawWiFiQualityPage()
 
     drawWiFiSignalMeter(quality);
 }
+// =============================================================================
+// Weather page (page 9)
+// =============================================================================
+
+// The bundled fonts only cover 0x20-0x7E, so there is no degree glyph: it is
+// drawn as a small circle next to the number instead.
+static void drawDegreeMark(int x, int y, uint16_t colour)
+{
+    tft.drawCircle(x, y, 3, colour);
+}
+
+static const char *windCompass(int deg)
+{
+    static const char *pts[16] = {"N",  "NNE", "NE", "ENE", "E",  "ESE", "SE", "SSE",
+                                  "S",  "SSW", "SW", "WSW", "W",  "WNW", "NW", "NNW"};
+    while (deg < 0) deg += 360;
+    deg %= 360;
+    int idx = (int)((deg + 11.25) / 22.5) % 16;
+    return pts[idx];
+}
+
+static uint16_t temperatureColour(float c)
+{
+    if (c < 0.0f)  return TFT_CYAN;
+    if (c < 10.0f) return TFT_SKYBLUE;
+    if (c < 20.0f) return TFT_GREEN;
+    if (c < 28.0f) return TFT_YELLOW;
+    if (c < 34.0f) return TFT_ORANGE;
+    return TFT_RED;
+}
+
+static void formatLocalHM(long epochUtc, char *out, size_t n)
+{
+    time_t t = (time_t)(epochUtc + (long)tOffset * 3600);
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    snprintf(out, n, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+}
+
+// Layout constants (320x240, rotation 3).  y is the top of the text, which is
+// what drawString() uses with TL_DATUM.
+static const int WX_RULE1 = 19;
+static const int WX_CITY  = 24;
+static const int WX_DESC  = 44;
+static const int WX_TEMP  = 60;
+static const int WX_RULE2 = 92;
+static const int WX_ROW0  = 100;
+static const int WX_ROWH  = 22;
+static const int WX_RULE3 = 206;
+static const int WX_FOOT  = 212;
+
+static const int WX_LLABEL = 8;
+static const int WX_LVALUE = 88;
+static const int WX_RLABEL = 160;
+static const int WX_RVALUE = 232;
+
+void drawWeatherPage()
+{
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+
+    tft.setFreeFont(&Orbitron_Medium8pt7b);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("WEATHER", WX_LLABEL, 2);
+    tft.drawFastHLine(4, WX_RULE1, 312, TFT_DARKGREY);
+
+    // Without a working key there is nothing to show, so say what to do about it.
+    if (!APIkeyIsValid || !weather.valid)
+    {
+        tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+        tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+        tft.drawString("NO WEATHER DATA", 10, 40);
+
+        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.drawString(apiKey == "No API Key yet"
+                           ? "No OpenWeather API key is configured."
+                           : "The OpenWeather key was rejected.",
+                       10, 80);
+        tft.drawString("Enter a free key in the web interface:", 10, 104);
+
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.drawString("http://hamclock.local/apikey.html", 10, 128);
+
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("Saving the key reboots the clock.", 10, 160);
+        return;
+    }
+
+    char buf[48], val[24];
+
+    // --- location -----------------------------------------------------------
+    // 13 px per character in this font: 23 characters is the most that fits.
+    snprintf(buf, sizeof(buf), "%.19s%s%s", weather.city,
+             weather.country[0] ? ", " : "", weather.country);
+    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(buf, 10, WX_CITY);
+
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%.38s", weather.description);   // 8 px per character
+    tft.drawString(buf, 10, WX_DESC);
+
+    // --- temperature --------------------------------------------------------
+    uint16_t tc = temperatureColour(weather.temp);
+    snprintf(buf, sizeof(buf), "%.1f", weather.temp);
+    tft.setFreeFont(&JetBrainsMono_Bold15pt7b);
+    tft.setTextColor(tc, TFT_BLACK);
+    tft.drawString(buf, 10, WX_TEMP);
+    int tw = tft.textWidth(buf);
+    drawDegreeMark(10 + tw + 9, WX_TEMP + 6, tc);
+    tft.drawString("C", 10 + tw + 18, WX_TEMP);
+
+    snprintf(buf, sizeof(buf), "feels %.1f C", weather.feelsLike);
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, 312, WX_TEMP + 10);
+    tft.setTextDatum(TL_DATUM);
+
+    tft.drawFastHLine(4, WX_RULE2, 312, TFT_DARKGREY);
+
+    // --- two-column detail grid --------------------------------------------
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+
+    auto cell = [&](int row, int labelX, int valueX, const char *label, const char *value)
+    {
+        int y = WX_ROW0 + row * WX_ROWH;
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString(label, labelX, y);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawString(value, valueX, y);
+    };
+
+    snprintf(val, sizeof(val), "%d %%", weather.humidity);
+    cell(0, WX_LLABEL, WX_LVALUE, "Humidity", val);
+    snprintf(val, sizeof(val), "%.1f %s", weather.windSpeed, windCompass(weather.windDeg));
+    cell(0, WX_RLABEL, WX_RVALUE, "Wind m/s", val);
+
+    snprintf(val, sizeof(val), "%d hPa", weather.pressure);
+    cell(1, WX_LLABEL, WX_LVALUE, "Pressure", val);
+    if (weather.windGust > 0.05f)
+        snprintf(val, sizeof(val), "%.1f", weather.windGust);
+    else
+        snprintf(val, sizeof(val), "-");
+    cell(1, WX_RLABEL, WX_RVALUE, "Gust m/s", val);
+
+    snprintf(val, sizeof(val), "%d %%", weather.clouds);
+    cell(2, WX_LLABEL, WX_LVALUE, "Clouds", val);
+    snprintf(val, sizeof(val), "%.1f km", weather.visibility / 1000.0);
+    cell(2, WX_RLABEL, WX_RVALUE, "Visib", val);
+
+    formatLocalHM(weather.sunrise, val, sizeof(val));
+    cell(3, WX_LLABEL, WX_LVALUE, "Sunrise", val);
+    formatLocalHM(weather.sunset, val, sizeof(val));
+    cell(3, WX_RLABEL, WX_RVALUE, "Sunset", val);
+
+    snprintf(val, sizeof(val), "%.1f/%.1f", weather.tempMin, weather.tempMax);
+    cell(4, WX_LLABEL, WX_LVALUE, "Min/Max", val);
+    if (weather.rain1h > 0.005f)
+        snprintf(val, sizeof(val), "%.1f mm", weather.rain1h);
+    else
+        snprintf(val, sizeof(val), "-");
+    cell(4, WX_RLABEL, WX_RVALUE, "Rain", val);
+
+    tft.drawFastHLine(4, WX_RULE3, 312, TFT_DARKGREY);
+
+    updateWeatherPageClock();
+}
+
+// Redrawn once a second: only the clock and the data age actually change.
+void updateWeatherPageClock()
+{
+    char buf[40], padded[40];
+
+    long localEpoch = timeClient.getEpochTime() + (tOffset * 3600);
+    time_t t = (time_t)localEpoch;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d LOC", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, 314, 4);
+    tft.setTextDatum(TL_DATUM);
+
+    if (!APIkeyIsValid || !weather.valid) return;
+
+    long ageMin = ((long)timeClient.getEpochTime() - weather.fetchedUnix) / 60;
+    if (ageMin < 0) ageMin = 0;
+    snprintf(buf, sizeof(buf), "Updated %ld min ago", ageMin);
+    snprintf(padded, sizeof(padded), "%-26s", buf);
+
+    // The fetch runs every five minutes, so anything much older means the
+    // requests are failing.
+    tft.setTextColor(ageMin > 15 ? TFT_ORANGE : TFT_DARKGREY, TFT_BLACK);
+    tft.drawString(padded, WX_LLABEL, WX_FOOT);
+}
+
 void drawQRCode(const char *text, int x, int y, int scale)
 {
     QRCode qrcode;
