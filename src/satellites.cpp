@@ -701,8 +701,10 @@ static const int COLHDR_Y   = 74;
 static const int RULE2_Y    = 88;
 static const int ROW0_Y     = 94;
 static const int ROW_H      = 24;
-static const int RULE3_Y    = 212;
-static const int FOOTER_Y   = 218;
+static const int TABLE_BOT  = 208;   // end of the table's clear region
+static const int FOOTER_Y   = 214;   // same 24 px pitch as the rows above
+
+static int g_footerMode = -1;   // -1 unknown, 0 status message, 1 pass row
 
 static const int COL_NAME = 6;
 static const int COL_AOS  = 112;
@@ -771,7 +773,43 @@ static void drawStaticFurniture(TFT_eSPI &tft)
     tft.drawString("AZ",  COL_AZ,   COLHDR_Y);
 
     tft.drawFastHLine(4, RULE2_Y, 312, TFT_DARKGREY);
-    tft.drawFastHLine(4, RULE3_Y, 312, TFT_DARKGREY);
+}
+
+// "TLE 6h" / "TLE 5d" / "no TLE" for the oldest element set on file.
+static void tleHealth(time_t utc, char *out, size_t n, uint16_t *colour)
+{
+    double oldestAgeH = -1.0;
+    uint8_t count;
+
+    SAT_LOCK();
+    count = g_slotCount;
+    for (uint8_t i = 0; i < g_slotCount; i++) {
+        if (!g_slots[i].recValid) continue;
+        if (g_slots[i].fetchedUnix && utc > (time_t)g_slots[i].fetchedUnix) {
+            double ageH = (double)(utc - (time_t)g_slots[i].fetchedUnix) / 3600.0;
+            if (ageH > oldestAgeH) oldestAgeH = ageH;
+        }
+    }
+    SAT_UNLOCK();
+
+    *colour = TFT_DARKGREY;
+    if (oldestAgeH < 0.0) {
+        snprintf(out, n, "%-8s", count ? "no TLE" : "");
+        if (count) *colour = TFT_ORANGE;
+    } else if (oldestAgeH < 99.0) {
+        snprintf(out, n, "%-8s", "");
+        char tmp[12];
+        snprintf(tmp, sizeof(tmp), "TLE %.0fh", oldestAgeH);
+        snprintf(out, n, "%-8s", tmp);
+        // TLEs go stale after about a week.
+        if (oldestAgeH > 48.0) *colour = TFT_ORANGE;
+    } else {
+        // Days, so a badly stale set cannot widen the field past its slot.
+        char tmp[12];
+        snprintf(tmp, sizeof(tmp), "TLE %.0fd", oldestAgeH / 24.0);
+        snprintf(out, n, "%-8s", tmp);
+        *colour = (oldestAgeH > 168.0) ? TFT_RED : TFT_ORANGE;
+    }
 }
 
 static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
@@ -789,6 +827,14 @@ static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
     tft.setTextDatum(TR_DATUM);
     tft.drawString(buf, 314, HDR_Y + 2);
     tft.setTextDatum(TL_DATUM);
+
+    // Element-set age sits between the title and the clock; the bottom line is
+    // needed for a pass row now.
+    char tle[12];
+    uint16_t tleColour;
+    tleHealth(utc, tle, sizeof(tle), &tleColour);
+    tft.setTextColor(tleColour, TFT_BLACK);
+    tft.drawString(tle, 146, HDR_Y + 2);
 }
 
 static void drawBanner(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool force)
@@ -875,10 +921,45 @@ static void drawBanner(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool force)
     tft.drawString(line2, 10, BANNER_Y + 28);
 }
 
+// One line of the pass list.  Used both for the table and for the bottom row.
+static void drawPassRow(TFT_eSPI &tft, int y, const char *satName,
+                        const sgp4::Pass &p, time_t utc, int tOffsetHours)
+{
+    uint16_t colour;
+    if (p.aosUnix <= (double)utc)             colour = TFT_GREEN;
+    else if (p.aosUnix - (double)utc < 600.0) colour = TFT_YELLOW;
+    else                                      colour = TFT_LIGHTGREY;
+
+    char name[14];
+    strlcpy(name, satName, sizeof(name));
+    padTo(name, 12, sizeof(name));
+
+    char aos[8];
+    fmtClock((time_t)p.aosUnix, tOffsetHours, aos, sizeof(aos));
+
+    char el[5];
+    snprintf(el, sizeof(el), "%2.0f", p.maxElDeg);
+
+    char dur[8];
+    fmtDuration((long)(p.losUnix - p.aosUnix), dur, sizeof(dur));
+
+    char az[10];
+    snprintf(az, sizeof(az), "%03.0f>%03.0f", p.aosAzDeg, p.losAzDeg);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+    tft.setTextColor(colour, TFT_BLACK);
+    tft.drawString(name, COL_NAME, y);
+    tft.drawString(aos,  COL_AOS,  y);
+    tft.drawString(el,   COL_EL,   y);
+    tft.drawString(dur,  COL_DUR,  y);
+    tft.drawString(az,   COL_AZ,   y);
+}
+
 static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool clearFirst)
 {
     if (clearFirst)
-        tft.fillRect(0, RULE2_Y + 1, 320, RULE3_Y - RULE2_Y - 1, TFT_BLACK);
+        tft.fillRect(0, RULE2_Y + 1, 320, TABLE_BOT - RULE2_Y - 1, TFT_BLACK);
 
     tft.setTextDatum(TL_DATUM);
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
@@ -907,34 +988,7 @@ static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool clearFir
             continue;
         }
 
-        const sgp4::Pass &p = rows[i].p;
-        uint16_t colour;
-        if (p.aosUnix <= (double)utc)              colour = TFT_GREEN;
-        else if (p.aosUnix - (double)utc < 600.0)  colour = TFT_YELLOW;
-        else                                       colour = TFT_LIGHTGREY;
-
-        char name[14];
-        strlcpy(name, names[i], sizeof(name));
-        padTo(name, 12, sizeof(name));
-
-        char aos[8];
-        fmtClock((time_t)p.aosUnix, tOffsetHours, aos, sizeof(aos));
-
-        char el[5];
-        snprintf(el, sizeof(el), "%2.0f", p.maxElDeg);
-
-        char dur[8];
-        fmtDuration((long)(p.losUnix - p.aosUnix), dur, sizeof(dur));
-
-        char az[10];
-        snprintf(az, sizeof(az), "%03.0f>%03.0f", p.aosAzDeg, p.losAzDeg);
-
-        tft.setTextColor(colour, TFT_BLACK);
-        tft.drawString(name, COL_NAME, y);
-        tft.drawString(aos,  COL_AOS,  y);
-        tft.drawString(el,   COL_EL,   y);
-        tft.drawString(dur,  COL_DUR,  y);
-        tft.drawString(az,   COL_AZ,   y);
+        drawPassRow(tft, y, names[i], rows[i].p, utc, tOffsetHours);
     }
 
     if (shown == 0) {
@@ -947,48 +1001,70 @@ static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours, bool clearFir
     }
 }
 
-static void drawFooter(TFT_eSPI &tft, time_t utc)
+// Bottom line: the satellite to get ready for on the left, element set health
+// right-aligned on the right.  At 8 px per character the row holds 39 columns,
+// so the two halves are budgeted rather than concatenated.
+static void drawFooter(TFT_eSPI &tft, time_t utc, int tOffsetHours)
 {
-    char buf[56];
+    char left[48];
     uint8_t bad = 0, count;
-    double oldestAgeH = -1.0;
+
+    char       nextName[16] = {0};
+    sgp4::Pass nextPass;
+    bool       haveNext = false;
 
     SAT_LOCK();
     count = g_slotCount;
-    for (uint8_t i = 0; i < g_slotCount; i++) {
-        if (!g_slots[i].recValid) { bad++; continue; }
-        if (g_slots[i].fetchedUnix && utc > (time_t)g_slots[i].fetchedUnix) {
-            double ageH = (double)(utc - (time_t)g_slots[i].fetchedUnix) / 3600.0;
-            if (ageH > oldestAgeH) oldestAgeH = ageH;
-        }
+    for (uint8_t i = 0; i < g_slotCount; i++)
+        if (!g_slots[i].recValid) bad++;
+
+    // The table above already lists the first `limit` live passes, so repeating
+    // its top row here would waste the line.  Skip past what is on screen and
+    // show the next prediction after it.
+    uint8_t limit = g_maxShown > 5 ? 5 : g_maxShown;
+    uint8_t listed = 0;
+    for (uint8_t i = 0; i < g_passCount; i++) {
+        if (g_passes[i].p.losUnix < (double)utc) continue;   // already over
+        if (listed++ < limit) continue;                      // visible in the table
+        strlcpy(nextName, g_slots[g_passes[i].slot].name, sizeof(nextName));
+        nextPass = g_passes[i].p;
+        haveNext = true;
+        break;
     }
-    double lat = g_latDeg, lon = g_lonDeg, minEl = g_minElevation;
+    uint8_t predicted = listed;
     SAT_UNLOCK();
+
+    // The row form and the message form occupy different pixels, so wipe the
+    // strip when switching between them rather than every second.
+    int mode = (bad == 0 && haveNext) ? 1 : 0;
+    if (mode != g_footerMode) {
+        tft.fillRect(0, FOOTER_Y - 2, 320, 18, TFT_BLACK);
+        g_footerMode = mode;
+    }
+
+    if (mode == 1) {
+        drawPassRow(tft, FOOTER_Y, nextName, nextPass, utc, tOffsetHours);
+        return;
+    }
 
     uint16_t colour = TFT_DARKGREY;
     if (bad) {
-        snprintf(buf, sizeof(buf), "%u sat  %u WITHOUT TLE  min el %.0f", count, bad, minEl);
+        snprintf(left, sizeof(left), "%u sat  %u WITHOUT TLE", count, bad);
         colour = TFT_RED;
-    } else if (oldestAgeH < 0.0) {
-        snprintf(buf, sizeof(buf), "%u sat  no TLE yet  min el %.0f", count, minEl);
-        colour = (count > 0) ? TFT_ORANGE : TFT_DARKGREY;
+    } else if (count == 0) {
+        snprintf(left, sizeof(left), "No satellites configured");
+    } else if (predicted > 0) {
+        snprintf(left, sizeof(left), "%u sat  %u pass%s predicted",
+                 count, predicted, predicted == 1 ? "" : "es");
     } else {
-        snprintf(buf, sizeof(buf), "%u sat  TLE %.0fh  %.2f%c %.2f%c  min el %.0f",
-                 count, oldestAgeH,
-                 fabs(lat), lat >= 0 ? 'N' : 'S',
-                 fabs(lon), lon >= 0 ? 'E' : 'W',
-                 minEl);
-        // TLEs go stale after about a week.
-        if (oldestAgeH > 168.0) colour = TFT_RED;
-        else if (oldestAgeH > 48.0) colour = TFT_ORANGE;
+        snprintf(left, sizeof(left), "%u sat  no upcoming pass", count);
     }
-
-    padTo(buf, 39, sizeof(buf));
+    padTo(left, 38, sizeof(left));
 
     tft.setTextDatum(TL_DATUM);
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
     tft.setTextColor(colour, TFT_BLACK);
-    tft.drawString(buf, COL_NAME, FOOTER_Y);
+    tft.drawString(left, COL_NAME, FOOTER_Y);
 }
 
 void satellitesDrawPage(TFT_eSPI &tft, time_t utcNow, int tOffsetHours, bool fullRedraw)
@@ -999,6 +1075,7 @@ void satellitesDrawPage(TFT_eSPI &tft, time_t utcNow, int tOffsetHours, bool ful
 
     if (fullRedraw) {
         drawStaticFurniture(tft);
+        g_footerMode = -1;
         lastVersion = 0xFFFFFFFFu;
         lastSecond  = 0;
         lastTable   = 0;
@@ -1018,7 +1095,7 @@ void satellitesDrawPage(TFT_eSPI &tft, time_t utcNow, int tOffsetHours, bool ful
     if (utcNow != lastSecond) {
         drawHeaderClock(tft, utcNow, tOffsetHours);
         drawBanner(tft, utcNow, tOffsetHours, fullRedraw);
-        drawFooter(tft, utcNow);
+        drawFooter(tft, utcNow, tOffsetHours);
         lastSecond = utcNow;
     }
 }
