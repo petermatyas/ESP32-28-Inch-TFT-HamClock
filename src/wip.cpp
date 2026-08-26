@@ -46,7 +46,11 @@ unsigned long currentMillis = millis();
 unsigned long lastActivity = 0;                        // Last time user interacted (for screensaver)
 unsigned long screenSaverTimeout = 1000 * 60 * 60 * 2; // 120 minute
 bool useScreenSaver = false;
-bool successFullTimeUpdate = false;
+// NTPClient::update() returns false both when a request fails and when it was
+// simply not due yet, so the only trustworthy signal is a true return.  Track
+// when that last happened.
+unsigned long lastNtpSyncMs = 0;
+bool ntpSyncedAtLeastOnce = false;
 int tOffset = 0; // will be updated via configuration device time (Iphone) and later via API call that contains offset according to lat & lon
 Preferences prefs;
 // --- globals ---
@@ -58,6 +62,16 @@ int scanCount = 0;
 bool inAPmode = false;
 bool autoPageChange = false;
 char bigClockLastDigit[4] = {' ', ' ', ' ', ' '};
+int8_t bigClockColonState = -1;   // big clock colon: -1 unknown, 0 hidden, 1 shown
+bool bigClockShowsUtc = false;    // big clock time base: false = QTH, true = UTC
+bool bigClockLabelDirty = true;
+
+// The QTH/UTC label, sat at the bottom of the screen.  The digits end at
+// y=175 and the screen at 240, so 208..236 leaves a small bottom margin.
+const int BIGCLOCK_BADGE_X = 118;
+const int BIGCLOCK_BADGE_Y = 208;
+const int BIGCLOCK_BADGE_W = 84;
+const int BIGCLOCK_BADGE_H = 28;
 // Struct to store all parsed solar data
 struct SolarData
 {
@@ -278,6 +292,9 @@ void drawSolarSummaryPage1();
 void drawSolarSummaryPage2();
 void drawSolarSummaryPage3();
 void drawWiFiQualityPage();
+void drawBigClockModeBadge();
+bool ntpTick();
+void drawNtpStatus(bool drawFrame);
 void drawWeatherPage();
 void updateWeatherPageClock();
 void redrawdrawMainPropagationPagePage1();
@@ -710,7 +727,7 @@ for (int i = 0; i < 4; i++) {
             timeClient.begin();
 
             // Wait until time is valid
-            while (!timeClient.update())
+            while (!ntpTick())
             {
                 delay(500);
             }
@@ -753,7 +770,6 @@ void loop()
     static unsigned long previousMillisForWeatherPageUpdate = 0;
     static unsigned long previousMillisForScroller = 0;
     static unsigned long previousMillisForAutoPageChanger = 0;
-    static unsigned long previousMillisForTimeClientUpdate = 0;
     static unsigned long previousMillisForBlinkDotsOnBigClock = 0;
 
     static unsigned long lastDotUpdate = 0;
@@ -762,6 +778,11 @@ void loop()
     // 🛰️ Keeps the element sets fresh and hands the current time to the
     // prediction task.  Rate-limits itself, so calling it every pass is fine.
     satellitesLoop((time_t)timeClient.getEpochTime());
+
+    // Keep the clock disciplined on every page.  Previously only pages 1, 2 and
+    // 7 polled, so the other pages let the clock free-run.  NTPClient rate-limits
+    // itself to its update interval, so calling this every pass is cheap.
+    ntpTick();
 
     if (!screenSaver)
     {
@@ -842,7 +863,7 @@ void loop()
                 LOCALlastTimeStr = "        ";
 
                 // 🕒 Update time display
-                timeClient.update();
+                ntpTick();
                 long localEpoch = timeClient.getEpochTime() + (tOffset * 3600);
                 String localTime = formatLocalTime(localEpoch);
                 String utcTime = timeClient.getFormattedTime();
@@ -882,7 +903,7 @@ void loop()
                 previousMillisForPropagationClockUpdate = currentMillis;
 
                 colonVisible = !colonVisible;
-                timeClient.update();
+                ntpTick();
                 long localEpoch = timeClient.getEpochTime() + (tOffset * 3600);
                 String localTime = formatLocalTime(localEpoch);
                 String utcTime = timeClient.getFormattedTime();
@@ -940,28 +961,29 @@ void loop()
             currentMillis = millis();
             tft.setFreeFont(&digits60pt7b);
 
-            if (currentMillis - previousMillisForTimeClientUpdate >= 16000 || LASTbigClockTimeStr == "") // to not overflow
+            // One second on, one second off.  Driven by the parity of the clock's
+            // own seconds rather than a millis() timer, so the blink stays in
+            // step with the time on screen instead of drifting against it.
             {
-                // 🕒 Update time display
-                if (timeClient.update())
+                int8_t wantColon = (timeClient.getEpochTime() % 2 == 0) ? 1 : 0;
+                if (wantColon != bigClockColonState)
                 {
-                    Serial.println("NTP update OK");
-                    successFullTimeUpdate = true;
-                    tft.setTextColor(bigClockColour);
+                    bigClockColonState = wantColon;
+                    tft.setFreeFont(&digits60pt7b);
+                    tft.setTextColor(wantColon ? bigClockColour : TFT_BLACK);
                     tft.drawString(":", 151, 65, 1);
                 }
-                else
-                {
-                    Serial.println("NTP update FAILED");
-                    successFullTimeUpdate = false;
-                    tft.setTextColor(TFT_RED);
-                    tft.drawString(":", 151, 65, 1);
-                }
-                previousMillisForTimeClientUpdate = currentMillis;
             }
-            long localEpoch = timeClient.getEpochTime() + (tOffset * 3600);
+            if (bigClockLabelDirty)
+            {
+                drawBigClockModeBadge();
+                bigClockLabelDirty = false;
+            }
 
-            struct tm *ptm = gmtime((time_t *)&localEpoch);
+            long shownEpoch = timeClient.getEpochTime() +
+                              (bigClockShowsUtc ? 0L : (long)tOffset * 3600L);
+
+            struct tm *ptm = gmtime((time_t *)&shownEpoch);
 
             String localTime = String(ptm->tm_hour < 10 ? "0" : "") + String(ptm->tm_hour) + ":" +
                                String(ptm->tm_min < 10 ? "0" : "") + String(ptm->tm_min);
@@ -972,6 +994,10 @@ void loop()
 
             if (localTime != LASTbigClockTimeStr)
             {
+                // Set the font at the point of use: the badge above draws with
+                // its own font and anything else added here would too.
+                tft.setFreeFont(&digits60pt7b);
+
                 // Break current time "HH:MM" into 4 chars
                 char currentDigits[4];
                 currentDigits[0] = localTime.charAt(0); // H tens
@@ -1436,6 +1462,7 @@ void loadSettings()
     autoPageChange = doc["autoPageChange"] | autoPageChange;
     useScreenSaver = doc["useScreenSaver"] | useScreenSaver;
     bigClockColour = doc["bigClockColour"] | bigClockColour;
+    bigClockShowsUtc = doc["bigClockShowsUtc"] | bigClockShowsUtc;
 
     Serial.println();
     Serial.println("-----------------------------------------------------------------");
@@ -1449,6 +1476,7 @@ void loadSettings()
     Serial.printf("🎨 utcFrameColour: 0x%04X\n", utcFrameColour);
     Serial.printf("🖍️ bannerColour: 0x%04X\n", bannerColour);
     Serial.printf("🖍️ bigClockColour: 0x%04X\n", bigClockColour);
+    Serial.printf("🕑 bigClockShowsUtc: %s\n", bigClockShowsUtc ? "UTC" : "QTH");
 
     Serial.printf("🐢 bannerSpeed: %d\n", bannerSpeed);
     Serial.printf("🕓 localTimeLabel: %s\n", localTimeLabel.c_str());
@@ -1480,6 +1508,7 @@ void saveSettings()
     doc["autoPageChange"] = autoPageChange;
     doc["useScreenSaver"] = useScreenSaver;
     doc["bigClockColour"] = bigClockColour;
+    doc["bigClockShowsUtc"] = bigClockShowsUtc;
     doc["screenSaverTimeout"] = screenSaverTimeout;
 
     fs::File file = SPIFFS.open("/settings.json", "w");
@@ -1504,6 +1533,7 @@ void saveSettings()
     Serial.printf("🕒 Local Time Color   : 0x%04X\n", localTimeColour);
     Serial.printf("🕒 UTC Time Color     : 0x%04X\n", utcTimeColour);
     Serial.printf("🕒 Big Time Color     : 0x%04X\n", bigClockColour);
+    Serial.printf("🕑 Big Clock Base     : %s\n", bigClockShowsUtc ? "UTC" : "QTH");
     Serial.printf("🖼️  Double Frame      : %s\n", doubleFrame ? "true" : "false");
     Serial.printf("🟩 Local Frame Color  : 0x%04X\n", localFrameColour);
     Serial.printf("🟦 UTC Frame Color    : 0x%04X\n", utcFrameColour);
@@ -1813,6 +1843,10 @@ static void activatePage(uint8_t page)
         {
             bigClockLastDigit[i] = ' ';
         }
+        // Unknown state, so the first pass through the loop paints the colon
+        // immediately after the screen clear.
+        bigClockColonState = -1;
+        bigClockLabelDirty = true;
         break;
     case 8:
         redrawSatellitePage = true;
@@ -1835,6 +1869,30 @@ void handleTouchToRotatePage()
         {
             wasTouching = true;
             lastTouchMs = now;
+
+            // On the big clock page the badge is a button: tapping it switches
+            // the time base rather than paging.  Checked first so the paging
+            // halves cannot swallow the tap.
+            if (activePage == 7 &&
+                x >= BIGCLOCK_BADGE_X - 10 && x <= BIGCLOCK_BADGE_X + BIGCLOCK_BADGE_W + 10 &&
+                y >= BIGCLOCK_BADGE_Y - 10 && y <= BIGCLOCK_BADGE_Y + BIGCLOCK_BADGE_H + 10)
+            {
+                bigClockShowsUtc = !bigClockShowsUtc;
+                Serial.printf("\U0001F551 Big clock time base -> %s\n",
+                              bigClockShowsUtc ? "UTC" : "QTH");
+                saveSettings();
+
+                // Force a full repaint of the digits in the new time base.
+                LASTbigClockTimeStr = "";
+                for (int i = 0; i < 4; i++)
+                {
+                    bigClockLastDigit[i] = ' ';
+                }
+                tft.fillScreen(TFT_BLACK);
+                bigClockColonState = -1;
+                bigClockLabelDirty = true;
+                return;
+            }
 
             // Tap the right half to go forward, the left half to go back.
             bool forward = (x >= tft.width() / 2);
@@ -2432,8 +2490,7 @@ void updateWiFiSignalDisplay()
     tft.print(": ");
     tft.print(newSignal);
 
-    // Update bar graph
-    drawWiFiSignalMeter(quality);
+    drawNtpStatus(false);
 
     // Save current values for next comparison
     lastRSSI = newRSSI;
@@ -2471,6 +2528,96 @@ void drawWiFiSignalMeter(int qualityPercent)
     }
     // draw a border around the full meter
     tft.drawRect(meterX - 2, meterY - 2, numBars * (barWidth + barSpacing) - barSpacing + 4, barHeight + 4, TFT_LIGHTGREY);
+}
+
+// Small badge under the big clock saying which time base is on screen.  It is
+// a touch target too - see handleTouchToRotatePage().
+void drawBigClockModeBadge()
+{
+    // No frame: just clear the strip so the previous label cannot show through.
+    tft.fillRect(BIGCLOCK_BADGE_X, BIGCLOCK_BADGE_Y,
+                 BIGCLOCK_BADGE_W, BIGCLOCK_BADGE_H, TFT_BLACK);
+
+    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+    tft.setTextColor(bigClockColour, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(bigClockShowsUtc ? "UTC" : "QTH",
+                   BIGCLOCK_BADGE_X + BIGCLOCK_BADGE_W / 2,
+                   BIGCLOCK_BADGE_Y + BIGCLOCK_BADGE_H / 2);
+
+    // Put back what the big clock page expects: top-left datum and the big
+    // digit font.  setFreeFont() is global state, so a helper that changes it
+    // has to hand it back.
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&digits60pt7b);
+}
+
+// Every NTP poll goes through here so the sync state is recorded in one place.
+bool ntpTick()
+{
+    bool synced = timeClient.update();
+    if (synced)
+    {
+        lastNtpSyncMs = millis();
+        ntpSyncedAtLeastOnce = true;
+    }
+    return synced;
+}
+
+// NTP health, in the place the signal meter used to occupy.
+void drawNtpStatus(bool drawFrame)
+{
+    const int boxX = 16, boxY = 198, boxW = 289, boxH = 22;
+    const int labelX = 26, valueX = 130, textY = boxY + 15;
+
+    if (drawFrame)
+        tft.drawRect(boxX, boxY, boxW, boxH, TFT_LIGHTGREY);
+
+    char value[40];
+    uint16_t colour;
+
+    if (!ntpSyncedAtLeastOnce)
+    {
+        snprintf(value, sizeof(value), "no sync yet");
+        colour = TFT_RED;
+    }
+    else
+    {
+        unsigned long ageSec = (millis() - lastNtpSyncMs) / 1000UL;
+        if (ageSec < 120)
+            snprintf(value, sizeof(value), "synced %lu s ago", ageSec);
+        else if (ageSec < 7200)
+            snprintf(value, sizeof(value), "synced %lu min ago", ageSec / 60);
+        else
+            snprintf(value, sizeof(value), "synced %lu h ago", ageSec / 3600);
+
+        // The client re-syncs every 15 s, so past a minute the requests are not
+        // getting through.
+        if (ageSec < 60)       colour = TFT_GREEN;
+        else if (ageSec < 300) colour = TFT_YELLOW;
+        else                   colour = TFT_RED;
+    }
+
+    // Same erase-then-redraw idiom the rest of this page uses.
+    static String lastValue = "";
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextSize(1);
+
+    tft.setTextColor(TFT_BLACK, TFT_BLACK);
+    tft.setCursor(valueX, textY);
+    tft.print(": ");
+    tft.print(lastValue);
+
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setCursor(labelX, textY);
+    tft.print("NTP");
+
+    tft.setTextColor(colour, TFT_BLACK);
+    tft.setCursor(valueX, textY);
+    tft.print(": ");
+    tft.print(value);
+
+    lastValue = value;
 }
 
 void drawWiFiQualityPage()
@@ -2516,7 +2663,7 @@ void drawWiFiQualityPage()
     printLine(" Hostname 1", hostname + ".local");
     printLine(" Hostname 2", "hamclock.local");
 
-    drawWiFiSignalMeter(quality);
+    drawNtpStatus(true);
 }
 // =============================================================================
 // Weather page (page 9)
