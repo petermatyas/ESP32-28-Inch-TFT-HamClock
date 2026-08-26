@@ -137,6 +137,10 @@ bool italicClockFonts = false;
 
 volatile bool refreshDigits = false;
 const String weatherAPI = "https://api.openweathermap.org/data/2.5/weather"; // OpenWeather API endpoint
+// The current-weather endpoint's temp_min/temp_max are not daily extremes -
+// for a single station they just repeat the current temperature.  The daily
+// range comes from the 3-hourly forecast instead.
+const String forecastAPI = "https://api.openweathermap.org/data/2.5/forecast";
 
 // Global variables for previous time tracking
 String previousLocalTime = "";
@@ -173,7 +177,9 @@ struct WeatherInfo
     char  city[32] = {0};
     char  country[6] = {0};
     char  description[40] = {0};
-    float temp = 0, feelsLike = 0, tempMin = 0, tempMax = 0;
+    float temp = 0, feelsLike = 0;
+    float tempMin = 0, tempMax = 0;   // daily range, see fetchForecastData()
+    bool  dailyValid = false;
     int   pressure = 0, humidity = 0, clouds = 0, visibility = 0;
     float windSpeed = 0, windGust = 0, rain1h = 0;
     int   windDeg = 0;
@@ -181,6 +187,12 @@ struct WeatherInfo
     long  fetchedUnix = 0;
 };
 WeatherInfo weather;
+
+// Whatever this clock has actually measured so far today.  The forecast only
+// covers slots that have not happened yet, so without this a morning low that
+// has already passed would never show up.
+int   weatherObsDay = -1;         // tm_yday the range below belongs to
+float weatherObsMin = 0, weatherObsMax = 0;
 
 // Relative x-offsets for HB97DIGITS12pt7b font layout
 const int xOffsets[8] = {
@@ -294,8 +306,9 @@ void drawSolarSummaryPage3();
 void drawWiFiQualityPage();
 void drawBigClockModeBadge();
 bool ntpTick();
-void drawNtpStatus(bool drawFrame);
+void drawNtpStatus();
 void drawWeatherPage();
+void fetchForecastData();
 void updateWeatherPageClock();
 void redrawdrawMainPropagationPagePage1();
 void fetchSolarData();
@@ -412,6 +425,7 @@ void setup()
 doc["screenSaverTimeout"] = screenSaverTimeout / 60000;  // convert ms → minutes
 doc ["APIkeyIsValid"] =APIkeyIsValid;
 doc ["autoPageChange"] =autoPageChange;
+doc ["bigClockShowsUtc"] = bigClockShowsUtc;
 
  Serial.println(APIkeyIsValid);
   String response;
@@ -734,6 +748,7 @@ for (int i = 0; i < 4; i++) {
             tryToRetrieveUTCoffsetFromFirstConfiguration();
 
             fetchWeatherData();
+            fetchForecastData();
             fetchSolarData();
             satellitesBegin(latitude, longitude);
             drawOrredrawStaticElements();
@@ -763,6 +778,7 @@ void loop()
 
     unsigned long currentMillis = millis();
     static unsigned long previousMillisForWeatherDataUpdate = 0;
+    static unsigned long previousMillisForForecastUpdate = 0;
     static unsigned long previousMillisForPropagationDataUpdate = 0;
     static unsigned long previousMillisForLargeClockUpdate = 0;
     static unsigned long previousMillisForPropagationClockUpdate = 0;
@@ -797,6 +813,14 @@ void loop()
 
         fetchWeatherData();
         redrawWeatherPage = true;
+    }
+
+    // The daily range moves slowly, so half an hour is plenty.
+    if (currentMillis - previousMillisForForecastUpdate >= 1000UL * 60 * 30 && APIkeyIsValid)
+    {
+        previousMillisForForecastUpdate = currentMillis;
+        Serial.println("Getting fresh forecast data");
+        fetchForecastData();
     }
     // 🌤️ Refresh propagation data every 5 minutes
     if (currentMillis - previousMillisForPropagationDataUpdate >= 1000UL * 60 * 5)
@@ -1072,6 +1096,97 @@ void loop()
     }
 }
 
+// Today's temperature range, from the 3-hourly forecast plus whatever this
+// clock has already measured today.
+void fetchForecastData()
+{
+    if (!APIkeyIsValid) return;
+
+    HTTPClient http;
+    String url = forecastAPI + "?lat=" + String(latitude) + "&lon=" + String(longitude) +
+                 "&appid=" + apiKey + "&units=metric&cnt=16";
+    http.setTimeout(8000);
+    http.begin(url);
+
+    int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK)
+    {
+        Serial.printf("Forecast fetch failed, HTTP %d\n", httpCode);
+        http.end();
+        return;
+    }
+
+    String payload = http.getString();
+    http.end();
+
+    // Only the timestamps and temperatures are kept, so the 16 entries cost a
+    // few hundred bytes instead of tens of kilobytes.
+    JsonDocument filter;
+    filter["list"][0]["dt"] = true;
+    filter["list"][0]["main"]["temp"] = true;
+    filter["list"][0]["main"]["temp_min"] = true;
+    filter["list"][0]["main"]["temp_max"] = true;
+
+    JsonDocument doc;
+    DeserializationError err =
+        deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    if (err)
+    {
+        Serial.printf("Forecast parse failed: %s\n", err.c_str());
+        return;
+    }
+
+    time_t localNow = (time_t)(timeClient.getEpochTime() + (long)tOffset * 3600);
+    struct tm today;
+    gmtime_r(&localNow, &today);
+
+    float lo = 0, hi = 0;
+    bool any = false;
+
+    for (JsonObject entry : doc["list"].as<JsonArray>())
+    {
+        long dt = entry["dt"] | 0L;
+        if (dt == 0) continue;
+
+        // Not named `local`: PNGdec's zutil.h has #define local static.
+        time_t slotLocal = (time_t)(dt + (long)tOffset * 3600);
+        struct tm slot;
+        gmtime_r(&slotLocal, &slot);
+        if (slot.tm_yday != today.tm_yday) continue;   // not today
+
+        float t  = entry["main"]["temp"] | 0.0f;
+        float tl = entry["main"]["temp_min"] | t;
+        float th = entry["main"]["temp_max"] | t;
+
+        if (!any) { lo = tl; hi = th; any = true; }
+        else
+        {
+            if (tl < lo) lo = tl;
+            if (th > hi) hi = th;
+        }
+    }
+
+    // Late in the day there may be no slots left; the measured range still is.
+    if (weatherObsDay == today.tm_yday)
+    {
+        if (!any) { lo = weatherObsMin; hi = weatherObsMax; any = true; }
+        else
+        {
+            if (weatherObsMin < lo) lo = weatherObsMin;
+            if (weatherObsMax > hi) hi = weatherObsMax;
+        }
+    }
+
+    if (!any) return;
+
+    weather.tempMin    = lo;
+    weather.tempMax    = hi;
+    weather.dailyValid = true;
+    redrawWeatherPage  = true;
+
+    Serial.printf("Daily temperature range: %.1f .. %.1f C\n", lo, hi);
+}
+
 // Fetch weather data
 void fetchWeatherData()
 {
@@ -1249,8 +1364,6 @@ void fetchWeatherData()
                 sizeof(weather.description));
         weather.temp        = temp;
         weather.feelsLike   = feels_like;
-        weather.tempMin     = temp_min;
-        weather.tempMax     = temp_max;
         weather.pressure    = pressure;
         weather.humidity    = humidity;
         weather.clouds      = clouds_all;
@@ -1263,6 +1376,30 @@ void fetchWeatherData()
         weather.sunset      = sunset;
         weather.fetchedUnix = timeClient.getEpochTime();
         weather.valid       = true;
+
+        // Fold this observation into today's measured range, rolling over at
+        // local midnight.
+        {
+            time_t localNow = (time_t)(timeClient.getEpochTime() + (long)tOffset * 3600);
+            struct tm lt;
+            gmtime_r(&localNow, &lt);
+            if (lt.tm_yday != weatherObsDay)
+            {
+                weatherObsDay = lt.tm_yday;
+                weatherObsMin = temp;
+                weatherObsMax = temp;
+            }
+            else
+            {
+                if (temp < weatherObsMin) weatherObsMin = temp;
+                if (temp > weatherObsMax) weatherObsMax = temp;
+            }
+            if (!weather.dailyValid)
+            {
+                weather.tempMin = weatherObsMin;
+                weather.tempMax = weatherObsMax;
+            }
+        }
         redrawWeatherPage   = true;
 
         // Convert sunrise and sunset times to local time
@@ -2450,6 +2587,10 @@ void drawSolarSummaryPage3()
 
 void updateWiFiSignalDisplay()
 {
+    // Pin the font rather than inheriting whatever was selected last.
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextSize(1);
+
     int rssi = WiFi.RSSI();
     int quality = constrain(2 * (rssi + 100), 0, 100);
 
@@ -2490,7 +2631,7 @@ void updateWiFiSignalDisplay()
     tft.print(": ");
     tft.print(newSignal);
 
-    drawNtpStatus(false);
+    drawNtpStatus();
 
     // Save current values for next comparison
     lastRSSI = newRSSI;
@@ -2564,22 +2705,22 @@ bool ntpTick()
     return synced;
 }
 
-// NTP health, in the place the signal meter used to occupy.
-void drawNtpStatus(bool drawFrame)
+// NTP health, in the place the signal meter used to occupy.  Laid out as one
+// more row of the list above: same x positions, same font, same 18 px pitch as
+// drawWiFiQualityPage()'s printLine().
+void drawNtpStatus()
 {
-    const int boxX = 16, boxY = 198, boxW = 289, boxH = 22;
-    const int labelX = 26, valueX = 130, textY = boxY + 15;
-
-    if (drawFrame)
-        tft.drawRect(boxX, boxY, boxW, boxH, TFT_LIGHTGREY);
+    const int labelX = 10;
+    const int valueX = 130;
+    const int textY = 15 + 10 * 18;   // the row after "Hostname 2"
 
     char value[40];
-    uint16_t colour;
 
+    // The client re-syncs every 15 s, so the age itself says whether the
+    // requests are getting through - the row is drawn in the list's own colour.
     if (!ntpSyncedAtLeastOnce)
     {
         snprintf(value, sizeof(value), "no sync yet");
-        colour = TFT_RED;
     }
     else
     {
@@ -2590,12 +2731,6 @@ void drawNtpStatus(bool drawFrame)
             snprintf(value, sizeof(value), "synced %lu min ago", ageSec / 60);
         else
             snprintf(value, sizeof(value), "synced %lu h ago", ageSec / 3600);
-
-        // The client re-syncs every 15 s, so past a minute the requests are not
-        // getting through.
-        if (ageSec < 60)       colour = TFT_GREEN;
-        else if (ageSec < 300) colour = TFT_YELLOW;
-        else                   colour = TFT_RED;
     }
 
     // Same erase-then-redraw idiom the rest of this page uses.
@@ -2608,11 +2743,11 @@ void drawNtpStatus(bool drawFrame)
     tft.print(": ");
     tft.print(lastValue);
 
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setCursor(labelX, textY);
-    tft.print("NTP");
+    tft.print(" NTP");
 
-    tft.setTextColor(colour, TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setCursor(valueX, textY);
     tft.print(": ");
     tft.print(value);
@@ -2663,7 +2798,7 @@ void drawWiFiQualityPage()
     printLine(" Hostname 1", hostname + ".local");
     printLine(" Hostname 2", "hamclock.local");
 
-    drawNtpStatus(true);
+    drawNtpStatus();
 }
 // =============================================================================
 // Weather page (page 9)
@@ -2800,36 +2935,43 @@ void drawWeatherPage()
         tft.drawString(value, valueX, y);
     };
 
+    // Top row: the day's temperature range and the humidity.
+    // Whole degrees: "-40/-30" is the widest this can get and still clears
+    // the right-hand column.
+    if (weather.dailyValid || weatherObsDay >= 0)
+        snprintf(val, sizeof(val), "%.0f/%.0f", weather.tempMin, weather.tempMax);
+    else
+        snprintf(val, sizeof(val), "-");
+    cell(0, WX_LLABEL, WX_LVALUE, "Min/Max", val);
     snprintf(val, sizeof(val), "%d %%", weather.humidity);
-    cell(0, WX_LLABEL, WX_LVALUE, "Humidity", val);
-    snprintf(val, sizeof(val), "%.1f %s", weather.windSpeed, windCompass(weather.windDeg));
-    cell(0, WX_RLABEL, WX_RVALUE, "Wind m/s", val);
+    cell(0, WX_RLABEL, WX_RVALUE, "Humidity", val);
 
     snprintf(val, sizeof(val), "%d hPa", weather.pressure);
     cell(1, WX_LLABEL, WX_LVALUE, "Pressure", val);
+    snprintf(val, sizeof(val), "%d %%", weather.clouds);
+    cell(1, WX_RLABEL, WX_RVALUE, "Clouds", val);
+
+    snprintf(val, sizeof(val), "%.1f %s", weather.windSpeed, windCompass(weather.windDeg));
+    cell(2, WX_LLABEL, WX_LVALUE, "Wind m/s", val);
     if (weather.windGust > 0.05f)
         snprintf(val, sizeof(val), "%.1f", weather.windGust);
     else
         snprintf(val, sizeof(val), "-");
-    cell(1, WX_RLABEL, WX_RVALUE, "Gust m/s", val);
+    cell(2, WX_RLABEL, WX_RVALUE, "Gust m/s", val);
 
-    snprintf(val, sizeof(val), "%d %%", weather.clouds);
-    cell(2, WX_LLABEL, WX_LVALUE, "Clouds", val);
     snprintf(val, sizeof(val), "%.1f km", weather.visibility / 1000.0);
-    cell(2, WX_RLABEL, WX_RVALUE, "Visib", val);
-
-    formatLocalHM(weather.sunrise, val, sizeof(val));
-    cell(3, WX_LLABEL, WX_LVALUE, "Sunrise", val);
-    formatLocalHM(weather.sunset, val, sizeof(val));
-    cell(3, WX_RLABEL, WX_RVALUE, "Sunset", val);
-
-    snprintf(val, sizeof(val), "%.1f/%.1f", weather.tempMin, weather.tempMax);
-    cell(4, WX_LLABEL, WX_LVALUE, "Min/Max", val);
+    cell(3, WX_LLABEL, WX_LVALUE, "Visib", val);
     if (weather.rain1h > 0.005f)
         snprintf(val, sizeof(val), "%.1f mm", weather.rain1h);
     else
         snprintf(val, sizeof(val), "-");
-    cell(4, WX_RLABEL, WX_RVALUE, "Rain", val);
+    cell(3, WX_RLABEL, WX_RVALUE, "Rain", val);
+
+    // Bottom row: the sun times.
+    formatLocalHM(weather.sunrise, val, sizeof(val));
+    cell(4, WX_LLABEL, WX_LVALUE, "Sunrise", val);
+    formatLocalHM(weather.sunset, val, sizeof(val));
+    cell(4, WX_RLABEL, WX_RVALUE, "Sunset", val);
 
     tft.drawFastHLine(4, WX_RULE3, 312, TFT_DARKGREY);
 
