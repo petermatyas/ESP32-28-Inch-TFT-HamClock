@@ -19,7 +19,6 @@
 #include <JetBrainsMono_Bold15pt7b.h>
 #include <JetBrainsMono_Light7pt7b.h>
 #include <JetBrainsMono_Bold11pt7b.h>
-#include <tinyxml2.h>
 #include <PNGdec.h>
 #include <SPIFFS.h>
 #include <ArduinoOTA.h>
@@ -32,10 +31,13 @@
 #include <Preferences.h>
 #include "html_page.h"
 #include "satellites.h"
+#include "dxcluster.h"
+#include <new>
+#include <esp_heap_caps.h>
+#include <sgp4.h>
 #include "html_success.h"
 #include "digits60pt7b.h"
 
-String apiKey;
 const byte DNS_PORT = 53;
 DNSServer dnsServer;
 IPAddress apIP(192, 168, 4, 1);
@@ -55,7 +57,7 @@ int tOffset = 0; // will be updated via configuration device time (Iphone) and l
 Preferences prefs;
 // --- globals ---
 uint8_t activePage = 1;
-const uint8_t MAX_PAGES = 9;
+const uint8_t MAX_PAGES = 12;
 unsigned long lastTouchMs = 0;
 bool wasTouching = false;
 int scanCount = 0;
@@ -118,7 +120,17 @@ SolarData solarData;
 WebServer server(80); // HTTP server on port 80
 
 // Configurable Settings (replace all previous #defines)
-bool APIkeyIsValid = false;
+bool weatherFetchOk = false;   // last Open-Meteo fetch succeeded
+// How often to ask Open-Meteo, in minutes.  Configurable at /weather.html; the
+// floor keeps the clock a polite client of a free service.
+uint8_t weatherIntervalMin = 10;
+static const uint8_t WEATHER_INTERVAL_MIN_LIMIT = 5;
+static const uint8_t WEATHER_INTERVAL_MAX_LIMIT = 120;
+
+static unsigned long weatherIntervalMs()
+{
+    return (unsigned long)weatherIntervalMin * 60UL * 1000UL;
+}
 float latitude = 46.4667118;
 float longitude = 6.8590456;
 uint16_t localTimeColour = TFT_GREEN;
@@ -136,11 +148,14 @@ String startupLogo = "logo3.png";
 bool italicClockFonts = false;
 
 volatile bool refreshDigits = false;
-const String weatherAPI = "https://api.openweathermap.org/data/2.5/weather"; // OpenWeather API endpoint
-// The current-weather endpoint's temp_min/temp_max are not daily extremes -
-// for a single station they just repeat the current temperature.  The daily
-// range comes from the 3-hourly forecast instead.
-const String forecastAPI = "https://api.openweathermap.org/data/2.5/forecast";
+// Open-Meteo needs no API key and lets the query name exactly the fields the
+// clock shows, so today's weather arrives in about 1.1 kB.  Its "current" block
+// steps every 15 minutes, and it reports the location's UTC offset in the same
+// reply - the clock's local time comes from there.
+const String openMeteoBase = "https://api.open-meteo.com/v1/forecast";
+// Open-Meteo has no reverse geocoder; this one needs no key either.  It is only
+// asked once per boot, to put a place name above the readings.
+const String reverseGeocodeBase = "https://api.bigdatacloud.net/data/reverse-geocode-client";
 
 // Global variables for previous time tracking
 String previousLocalTime = "";
@@ -167,6 +182,9 @@ bool redrawSolarSummaryPage3 = true;
 bool reDrawWiFiQualityPage = true;
 bool redrawSatellitePage = true;
 bool redrawWeatherPage = true;
+bool redrawBeaconPage = true;
+bool redrawSunMoonPage = true;
+bool redrawDxPage = true;
 
 // fetchWeatherData() used to parse the OpenWeather response into locals and
 // throw everything away except the scrolling banner; the weather page needs the
@@ -175,24 +193,21 @@ struct WeatherInfo
 {
     bool  valid = false;
     char  city[32] = {0};
-    char  country[6] = {0};
+    char  country[16] = {0};
     char  description[40] = {0};
     float temp = 0, feelsLike = 0;
-    float tempMin = 0, tempMax = 0;   // daily range, see fetchForecastData()
+    float tempMin = 0, tempMax = 0;   // today's range
     bool  dailyValid = false;
-    int   pressure = 0, humidity = 0, clouds = 0, visibility = 0;
-    float windSpeed = 0, windGust = 0, rain1h = 0;
+    int   pressure = 0, humidity = 0, clouds = 0;
+    float visibilityKm = 0, windSpeed = 0, windGust = 0, rainMM = 0;
     int   windDeg = 0;
-    long  sunrise = 0, sunset = 0;
+    char  windDir[6] = {0};           // compass point derived from windDeg
+    char  sunrise[8] = {0};           // "06:06" local
+    char  sunset[8] = {0};
     long  fetchedUnix = 0;
 };
 WeatherInfo weather;
 
-// Whatever this clock has actually measured so far today.  The forecast only
-// covers slots that have not happened yet, so without this a morning low that
-// has already passed would never show up.
-int   weatherObsDay = -1;         // tm_yday the range below belongs to
-float weatherObsMin = 0, weatherObsMax = 0;
 
 // Relative x-offsets for HB97DIGITS12pt7b font layout
 const int xOffsets[8] = {
@@ -283,6 +298,11 @@ void drawQRCode(const char *text, int x, int y, int scale);
 void drawQRcodeInstructions();
 void startConfigurationPortal();
 bool tryToConnectSavedWiFi();
+// Saved WiFi list: defined next to tryToConnectSavedWiFi(), used from
+// setup() and the captive portal handlers above it.
+static void wifiRegisterRoutes();
+static uint8_t wifiNetCount();
+static bool wifiNetAdd(const String &ssid, const String &pass);
 void fetchWeatherData();
 String formatLocalTime(long epochTime);
 String convertEpochToTimeString(long epochTime);
@@ -290,10 +310,6 @@ void displayTime(int x, int y, String time, String &previousTime, int yOffset, u
 String convertTimestampToDate(long timestamp);
 void loadSettings();
 void handleRoot();
-void handleApiKeyPage();
-void handleSaveApiKey();
-void handleGetApiKey();
-void retrieveAPIkeyFromPref();
 void handleSave();
 void drawOrredrawStaticElements();
 void mountAndListSPIFFS(uint8_t levels = 255, bool listContent = true);
@@ -305,10 +321,12 @@ void drawSolarSummaryPage2();
 void drawSolarSummaryPage3();
 void drawWiFiQualityPage();
 void drawBigClockModeBadge();
+static void maidenhead(double latDeg, double lonDeg, char *out, size_t n);
 bool ntpTick();
 void drawNtpStatus();
 void drawWeatherPage();
-void fetchForecastData();
+void drawBeaconPage(bool fullRedraw);
+void drawSunMoonPage(bool fullRedraw);
 void updateWeatherPageClock();
 void redrawdrawMainPropagationPagePage1();
 void fetchSolarData();
@@ -333,12 +351,119 @@ int32_t fileRead(PNGFILE *handle, uint8_t *buffer, int32_t length);
 int32_t fileSeek(PNGFILE *handle, int32_t position);
 void displayPNGfromSPIFFS(const char *filename, int duration_ms);
 
+// When operator new cannot allocate it throws, and with no handler in the app
+// that becomes abort() - the device reboots and the backtrace says nothing
+// about how much was being asked for or which pool ran dry.  This runs first.
+//
+// MALLOC_CAP_8BIT is the pool new/malloc actually draw byte-addressable memory
+// from; ESP.getFreeHeap() also counts IRAM and reads healthy while this one is
+// empty, which is exactly how an earlier reboot loop stayed hidden.
+static void reportAllocationFailure()
+{
+    Serial.println();
+    Serial.println("!!! ALLOCATION FAILED - heap at the moment of failure:");
+    Serial.printf("    8-bit    free %7u  largest %7u\n",
+                  heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    Serial.printf("    internal free %7u  largest %7u\n",
+                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    Serial.printf("    lowest 8-bit free ever %u\n",
+                  heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+    Serial.flush();
+
+    Serial.println("    checking heap integrity...");
+    bool intact = heap_caps_check_integrity_all(true);
+    Serial.printf("    heap integrity: %s\n", intact ? "OK" : "CORRUPT");
+    Serial.flush();
+
+    // Throw rather than abort, so a caller that guards its parse can carry on.
+    throw std::bad_alloc();
+}
+
+// The ESP32 records why it last reset; printing it in words turns "it
+// rebooted" into an actual diagnosis.
+static const char *resetReasonName()
+{
+    switch (esp_reset_reason())
+    {
+    case ESP_RST_POWERON:   return "power on";
+    case ESP_RST_EXT:       return "external reset pin";
+    case ESP_RST_SW:        return "software restart (esp_restart)";
+    case ESP_RST_PANIC:     return "PANIC - exception or abort()";
+    case ESP_RST_INT_WDT:   return "INTERRUPT WATCHDOG";
+    case ESP_RST_TASK_WDT:  return "TASK WATCHDOG";
+    case ESP_RST_WDT:       return "other watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT - supply voltage dipped";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "unknown";
+    }
+}
+
+// Refresh interval, read and written by /weather.html.
+static void weatherRegisterRoutes()
+{
+    server.on("/weathercfg", HTTP_GET, []()
+              {
+        JsonDocument doc;
+        doc["intervalMin"] = weatherIntervalMin;
+        doc["minMin"] = WEATHER_INTERVAL_MIN_LIMIT;
+        doc["maxMin"] = WEATHER_INTERVAL_MAX_LIMIT;
+        doc["ok"] = weatherFetchOk;
+        doc["city"] = weather.city;
+        doc["country"] = weather.country;
+        doc["description"] = weather.description;
+        doc["temp"] = weather.temp;
+        doc["feelsLike"] = weather.feelsLike;
+        doc["tempMin"] = weather.tempMin;
+        doc["tempMax"] = weather.tempMax;
+        doc["humidity"] = weather.humidity;
+        doc["clouds"] = weather.clouds;
+        doc["pressure"] = weather.pressure;
+        doc["windGust"] = weather.windGust;
+        doc["visibilityKm"] = weather.visibilityKm;
+        doc["windSpeed"] = weather.windSpeed;
+        doc["windDir"] = weather.windDir;
+        doc["rainMM"] = weather.rainMM;
+        doc["sunrise"] = weather.sunrise;
+        doc["sunset"] = weather.sunset;
+        doc["fetchedUnix"] = (uint32_t)weather.fetchedUnix;
+        doc["utc"] = (uint32_t)timeClient.getEpochTime();
+        doc["tOffset"] = tOffset;
+        String out;
+        serializeJson(doc, out);
+        server.send(200, "application/json", out); });
+
+    server.on("/weathercfg", HTTP_POST, []()
+              {
+        JsonDocument doc;
+        if (!server.hasArg("plain") || deserializeJson(doc, server.arg("plain"))) {
+            server.send(400, "application/json", "{\"error\":\"bad json\"}");
+            return;
+        }
+        int mins = doc["intervalMin"] | (int)weatherIntervalMin;
+        if (mins < WEATHER_INTERVAL_MIN_LIMIT) mins = WEATHER_INTERVAL_MIN_LIMIT;
+        if (mins > WEATHER_INTERVAL_MAX_LIMIT) mins = WEATHER_INTERVAL_MAX_LIMIT;
+        weatherIntervalMin = (uint8_t)mins;
+        saveSettings();
+        Serial.printf("Weather refresh interval set to %u min\n", weatherIntervalMin);
+        server.send(200, "application/json", "{\"status\":\"ok\"}"); });
+
+    server.on("/weathernow", HTTP_GET, []()
+              {
+        server.send(200, "application/json", "{\"status\":\"fetching\"}");
+        fetchWeatherData(); });
+}
+
 void setup()
 {
 
     // Start Serial Monitor
     Serial.begin(115200);
     Serial.println("Starting setup...");
+    std::set_new_handler(reportAllocationFailure);
+    Serial.printf("\U0001FA7A Last reset reason: %s\n", resetReasonName());
 
     // Backlight pin setup
     pinMode(TFT_BLP, OUTPUT);
@@ -365,8 +490,6 @@ void setup()
     //tft.setTextColor(TFT_GREEN);
     //tft.drawCentreString("Beta Pre-Release", 160, 210, 1);
 
-    retrieveAPIkeyFromPref();
-    // apiKey="";
 
     labelSprite.setColorDepth(8);
     labelSprite.createSprite(120, 30); // Size depends on font & text
@@ -405,6 +528,13 @@ void setup()
             server.serveStatic("/logo4.png", SPIFFS, "/logo4.png");
             server.serveStatic("/github.png", SPIFFS, "/github.png");
             server.serveStatic("/favicon.ico", SPIFFS, "/favicon.ico");
+            // Shared theme, navigation and the pages added since.
+            server.serveStatic("/hamclock.css", SPIFFS, "/hamclock.css");
+            server.serveStatic("/hamclock.js", SPIFFS, "/hamclock.js");
+            server.serveStatic("/wifi.html", SPIFFS, "/wifi.html");
+            server.serveStatic("/weather.html", SPIFFS, "/weather.html");
+            wifiRegisterRoutes();
+            weatherRegisterRoutes();
             server.on("/config", HTTP_GET, []()
                       {
   JsonDocument doc;
@@ -423,11 +553,9 @@ void setup()
   doc["startupLogo"] = startupLogo;
   doc["italicClockFonts"] = italicClockFonts;
 doc["screenSaverTimeout"] = screenSaverTimeout / 60000;  // convert ms → minutes
-doc ["APIkeyIsValid"] =APIkeyIsValid;
 doc ["autoPageChange"] =autoPageChange;
 doc ["bigClockShowsUtc"] = bigClockShowsUtc;
 
- Serial.println(APIkeyIsValid);
   String response;
   serializeJson(doc, response);
   server.send(200, "application/json", response); });
@@ -568,6 +696,10 @@ for (int i = 0; i < 4; i++) {
     Serial.printf("📍 Latitude updated to: %.6f\n", latitude);
     Serial.printf("📍 Longitude updated to: %.6f\n", longitude);
     saveSettings();
+    // The locator on the QTH frame moves with the position.  Only repaint when
+    // that page is the one on screen - the redraw clears the whole display.
+    if (activePage == 1) drawOrredrawStaticElements();
+    weather.city[0] = 0;      // re-resolve the place name for the new position
     fetchWeatherData();
     server.send(200, "text/plain", "OK"); });
 
@@ -715,10 +847,7 @@ for (int i = 0; i < 4; i++) {
   }
   server.send(400, "application/json", "{\"status\":\"bad request\"}"); });
 
-            server.on("/apikey.html", handleApiKeyPage);
 
-            server.on("/saveApiKey", handleSaveApiKey);
-            server.on("/getApiKey", handleGetApiKey);
 
             server.on("/setAutoPage", HTTP_GET, []()
                       {
@@ -734,6 +863,7 @@ for (int i = 0; i < 4; i++) {
                       });
 
             satellitesRegisterRoutes(server);
+            dxClusterRegisterRoutes(server);
 
             server.begin();
 
@@ -748,9 +878,9 @@ for (int i = 0; i < 4; i++) {
             tryToRetrieveUTCoffsetFromFirstConfiguration();
 
             fetchWeatherData();
-            fetchForecastData();
             fetchSolarData();
             satellitesBegin(latitude, longitude);
+            dxClusterBegin();
             drawOrredrawStaticElements();
 
             scrollingText.setColorDepth(8);
@@ -777,9 +907,12 @@ void loop()
     }
 
     unsigned long currentMillis = millis();
+    static unsigned long previousMillisForHealth = 0;
     static unsigned long previousMillisForWeatherDataUpdate = 0;
-    static unsigned long previousMillisForForecastUpdate = 0;
     static unsigned long previousMillisForPropagationDataUpdate = 0;
+    // Half-length first interval, so the solar fetch settles out of step with
+    // the weather one and their peak allocations never add up.
+    static unsigned long propagationInterval = 150000UL;
     static unsigned long previousMillisForLargeClockUpdate = 0;
     static unsigned long previousMillisForPropagationClockUpdate = 0;
     static unsigned long previousMillisForWiFiPageUpdate = 0;
@@ -795,6 +928,26 @@ void loop()
     // prediction task.  Rate-limits itself, so calling it every pass is fine.
     satellitesLoop((time_t)timeClient.getEpochTime());
 
+    // A heap that only ever shrinks points at a leak; a largest-block that
+    // shrinks faster than the total points at fragmentation.  MALLOC_CAP_8BIT
+    // is the pool new/malloc actually draw from - ESP.getFreeHeap() also counts
+    // IRAM and reads healthy while this one is empty.
+    if (currentMillis - previousMillisForHealth >= 30000UL)
+    {
+        previousMillisForHealth = currentMillis;
+        Serial.printf("\U0001FA7A HEALTH up=%lus 8bit=%u min8=%u largest8=%u stack=%u page=%u\n",
+                      millis() / 1000UL,
+                      heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                      heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+                      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                      (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                      activePage);
+        satellitesReportHealth();
+        dxClusterReportHealth();
+        if (!heap_caps_check_integrity_all(false))
+            Serial.println("!!! HEAP CORRUPTION DETECTED by the periodic check");
+    }
+
     // Keep the clock disciplined on every page.  Previously only pages 1, 2 and
     // 7 polled, so the other pages let the clock free-run.  NTPClient rate-limits
     // itself to its update interval, so calling this every pass is cheap.
@@ -805,27 +958,19 @@ void loop()
         handleTouchToRotatePage();
     }
 
-    // 🌤️ Refresh weather data every 5 minutes
-    if (currentMillis - previousMillisForWeatherDataUpdate >= 1000UL * 60 * 5 && APIkeyIsValid)
+    // 🌤️ Weather from Open-Meteo, on the interval set in the web interface.
+    if (currentMillis - previousMillisForWeatherDataUpdate >= weatherIntervalMs())
     {
         previousMillisForWeatherDataUpdate = currentMillis;
-        Serial.println("Getting fresh weather data");
-
+        Serial.printf("Getting fresh weather data (every %u min)\n", weatherIntervalMin);
         fetchWeatherData();
-        redrawWeatherPage = true;
     }
 
-    // The daily range moves slowly, so half an hour is plenty.
-    if (currentMillis - previousMillisForForecastUpdate >= 1000UL * 60 * 30 && APIkeyIsValid)
-    {
-        previousMillisForForecastUpdate = currentMillis;
-        Serial.println("Getting fresh forecast data");
-        fetchForecastData();
-    }
     // 🌤️ Refresh propagation data every 5 minutes
-    if (currentMillis - previousMillisForPropagationDataUpdate >= 1000UL * 60 * 5)
+    if (currentMillis - previousMillisForPropagationDataUpdate >= propagationInterval)
     {
         previousMillisForPropagationDataUpdate = currentMillis;
+        propagationInterval = 1000UL * 60 * 5;
         Serial.println("Getting fresh propagation data");
         fetchSolarData();
         redrawMainPropagationPage = true;
@@ -1073,6 +1218,28 @@ void loop()
             }
             break;
         }
+
+        case 10:
+        {
+            // Cheap: the renderer decides for itself what actually changed.
+            drawBeaconPage(redrawBeaconPage);
+            redrawBeaconPage = false;
+            break;
+        }
+
+        case 11:
+        {
+            drawSunMoonPage(redrawSunMoonPage);
+            redrawSunMoonPage = false;
+            break;
+        }
+
+        case 12:
+        {
+            dxClusterDrawPage(tft, (time_t)timeClient.getEpochTime(), redrawDxPage);
+            redrawDxPage = false;
+            break;
+        }
         }
 
     if (autoPageChange)
@@ -1098,345 +1265,218 @@ void loop()
 
 // Today's temperature range, from the 3-hourly forecast plus whatever this
 // clock has already measured today.
-void fetchForecastData()
+static const char *windCompass(int deg)
 {
-    if (!APIkeyIsValid) return;
+    static const char *pts[16] = {"N",  "NNE", "NE", "ENE", "E",  "ESE", "SE", "SSE",
+                                  "S",  "SSW", "SW", "WSW", "W",  "WNW", "NW", "NNW"};
+    while (deg < 0) deg += 360;
+    deg %= 360;
+    return pts[(int)((deg + 11.25) / 22.5) % 16];
+}
 
-    HTTPClient http;
-    String url = forecastAPI + "?lat=" + String(latitude) + "&lon=" + String(longitude) +
-                 "&appid=" + apiKey + "&units=metric&cnt=16";
-    http.setTimeout(8000);
-    http.begin(url);
-
-    int httpCode = http.GET();
-    if (httpCode != HTTP_CODE_OK)
+// Open-Meteo reports the sky as a WMO present-weather code rather than text.
+static const char *wmoDescription(int code)
+{
+    switch (code)
     {
-        Serial.printf("Forecast fetch failed, HTTP %d\n", httpCode);
-        http.end();
+    case 0:  return "clear sky";
+    case 1:  return "mainly clear";
+    case 2:  return "partly cloudy";
+    case 3:  return "overcast";
+    case 45: return "fog";
+    case 48: return "depositing rime fog";
+    case 51: return "light drizzle";
+    case 53: return "moderate drizzle";
+    case 55: return "dense drizzle";
+    case 56: return "light freezing drizzle";
+    case 57: return "dense freezing drizzle";
+    case 61: return "slight rain";
+    case 63: return "moderate rain";
+    case 65: return "heavy rain";
+    case 66: return "light freezing rain";
+    case 67: return "heavy freezing rain";
+    case 71: return "slight snowfall";
+    case 73: return "moderate snowfall";
+    case 75: return "heavy snowfall";
+    case 77: return "snow grains";
+    case 80: return "slight rain showers";
+    case 81: return "moderate rain showers";
+    case 82: return "violent rain showers";
+    case 85: return "slight snow showers";
+    case 86: return "heavy snow showers";
+    case 95: return "thunderstorm";
+    case 96: return "thunderstorm, slight hail";
+    case 99: return "thunderstorm, heavy hail";
+    default: return "unknown";
+    }
+}
+
+// "2026-08-27T06:06" -> "06:06".  Open-Meteo already reports these in local
+// time when the query asks for timezone=auto.
+static void isoTimeOfDay(const char *iso, char *out, size_t n)
+{
+    const char *t = iso ? strchr(iso, 'T') : NULL;
+    if (!t || strlen(t) < 6)
+    {
+        snprintf(out, n, "--:--");
         return;
     }
+    snprintf(out, n, "%.5s", t + 1);
+}
 
-    String payload = http.getString();
+// A place name for the top of the weather page.  Open-Meteo does not return
+// one, and this only changes when the configured position does, so it is asked
+// for once per boot rather than on every refresh.
+static void fetchPlaceName()
+{
+    HTTPClient http;
+    String url = reverseGeocodeBase + "?latitude=" + String(latitude, 4) +
+                 "&longitude=" + String(longitude, 4) + "&localityLanguage=en";
+    http.setTimeout(8000);
+    if (!http.begin(url)) return;
+
+    int code = http.GET();
+    String body = (code == HTTP_CODE_OK) ? http.getString() : String();
     http.end();
+    if (body.isEmpty()) return;
 
-    // Only the timestamps and temperatures are kept, so the 16 entries cost a
-    // few hundred bytes instead of tens of kilobytes.
     JsonDocument filter;
-    filter["list"][0]["dt"] = true;
-    filter["list"][0]["main"]["temp"] = true;
-    filter["list"][0]["main"]["temp_min"] = true;
-    filter["list"][0]["main"]["temp_max"] = true;
+    filter["locality"] = true;
+    filter["city"] = true;
+    filter["countryName"] = true;
 
     JsonDocument doc;
-    DeserializationError err =
-        deserializeJson(doc, payload, DeserializationOption::Filter(filter));
-    if (err)
+    if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) return;
+
+    const char *place = doc["locality"] | doc["city"] | "";
+    if (place[0])
     {
-        Serial.printf("Forecast parse failed: %s\n", err.c_str());
-        return;
+        strlcpy(weather.city, place, sizeof(weather.city));
+        strlcpy(weather.country, doc["countryName"] | "", sizeof(weather.country));
+        Serial.printf("Location resolved to %s, %s\n", weather.city, weather.country);
     }
-
-    time_t localNow = (time_t)(timeClient.getEpochTime() + (long)tOffset * 3600);
-    struct tm today;
-    gmtime_r(&localNow, &today);
-
-    float lo = 0, hi = 0;
-    bool any = false;
-
-    for (JsonObject entry : doc["list"].as<JsonArray>())
-    {
-        long dt = entry["dt"] | 0L;
-        if (dt == 0) continue;
-
-        // Not named `local`: PNGdec's zutil.h has #define local static.
-        time_t slotLocal = (time_t)(dt + (long)tOffset * 3600);
-        struct tm slot;
-        gmtime_r(&slotLocal, &slot);
-        if (slot.tm_yday != today.tm_yday) continue;   // not today
-
-        float t  = entry["main"]["temp"] | 0.0f;
-        float tl = entry["main"]["temp_min"] | t;
-        float th = entry["main"]["temp_max"] | t;
-
-        if (!any) { lo = tl; hi = th; any = true; }
-        else
-        {
-            if (tl < lo) lo = tl;
-            if (th > hi) hi = th;
-        }
-    }
-
-    // Late in the day there may be no slots left; the measured range still is.
-    if (weatherObsDay == today.tm_yday)
-    {
-        if (!any) { lo = weatherObsMin; hi = weatherObsMax; any = true; }
-        else
-        {
-            if (weatherObsMin < lo) lo = weatherObsMin;
-            if (weatherObsMax > hi) hi = weatherObsMax;
-        }
-    }
-
-    if (!any) return;
-
-    weather.tempMin    = lo;
-    weather.tempMax    = hi;
-    weather.dailyValid = true;
-    redrawWeatherPage  = true;
-
-    Serial.printf("Daily temperature range: %.1f .. %.1f C\n", lo, hi);
 }
 
 // Fetch weather data
 void fetchWeatherData()
 {
+    if (weather.city[0] == 0) fetchPlaceName();
+
     HTTPClient http;
-    String weatherURL = weatherAPI + "?lat=" + String(latitude) + "&lon=" + String(longitude) + "&appid=" + apiKey + "&units=metric";
+    String url = openMeteoBase +
+                 "?latitude=" + String(latitude, 4) +
+                 "&longitude=" + String(longitude, 4) +
+                 "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+                 "pressure_msl,cloud_cover,wind_speed_10m,wind_direction_10m,"
+                 "wind_gusts_10m,precipitation,weather_code" +
+                 "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset" +
+                 "&hourly=visibility&forecast_days=1&forecast_hours=1" +
+                 "&timezone=auto&wind_speed_unit=ms";
+    Serial.println("Weather URL: " + url);
 
-    // Make GET Request
-    Serial.println("");
-    Serial.println("Weather API URL to test in Broswer");
-    Serial.println(weatherURL);
-    Serial.println("");
-
-    http.begin(weatherURL);
-
-    int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK)
+    http.setTimeout(12000);
+    if (!http.begin(url))
     {
-        String payload = http.getString();
-        // Serial.println(payload);
-        Serial.println("Weather data received.");
-
-        // Parse the JSON response
-        JsonDocument doc;
-        deserializeJson(doc, payload);
-
-        // Extracting values from the JSON response and assigning to variables
-
-        // Coordinates
-        float lon = doc["coord"]["lon"];
-        float lat = doc["coord"]["lat"];
-
-        // Weather
-        int weatherId = doc["weather"][0]["id"];
-        const char *weatherMain = doc["weather"][0]["main"];
-        const char *weatherDescription = doc["weather"][0]["description"];
-        const char *weatherIcon = doc["weather"][0]["icon"];
-
-        // Base
-        const char *base = doc["base"];
-
-        // Main weather data
-        float temp = doc["main"]["temp"];
-        float feels_like = doc["main"]["feels_like"];
-        float temp_min = doc["main"]["temp_min"];
-        float temp_max = doc["main"]["temp_max"];
-        int pressure = doc["main"]["pressure"];
-        int humidity = doc["main"]["humidity"];
-        int sea_level = doc["main"]["sea_level"];
-        int grnd_level = doc["main"]["grnd_level"];
-
-        // Visibility
-        int visibility = doc["visibility"];
-
-        // Wind data
-        float wind_speed = doc["wind"]["speed"];
-        int wind_deg = doc["wind"]["deg"];
-        float wind_gust = doc["wind"]["gust"];
-
-        // Rain data
-        float rain_1h = doc["rain"]["1h"];
-
-        // Clouds data
-        int clouds_all = doc["clouds"]["all"];
-
-        // Date/Time
-        long dt = doc["dt"];
-
-        // System data
-        int sys_type = doc["sys"]["type"];
-        int sys_id = doc["sys"]["id"];
-        const char *sys_country = doc["sys"]["country"];
-        long sunrise = doc["sys"]["sunrise"];
-        long sunset = doc["sys"]["sunset"];
-
-        // Timezone
-        int tzOffsetSeconds = 0;
-        if (doc["timezone"].is<int>())
-        {
-            tzOffsetSeconds = doc["timezone"].as<int>(); // e.g. 7200
-        }
-        int tzOffsetHours = tzOffsetSeconds / 3600;
-        tOffset = tzOffsetHours;
-        Serial.printf("🕰️ tOffset set to %d (from %d seconds retrieved from API response)\n", tOffset, tzOffsetSeconds);
-
-        // Location data
-        int id = doc["id"];
-        const char *name = doc["name"];
-
-        // Status code
-        int cod = doc["cod"];
-
-        // Print the extracted values
-        Serial.println("Weather data received.");
-        Serial.print("Coordinates: ");
-        Serial.print("Longitude: ");
-        Serial.print(lon);
-        Serial.print(", Latitude: ");
-        Serial.println(lat);
-
-        Serial.print("Weather ID: ");
-        Serial.println(weatherId);
-        Serial.print("Main: ");
-        Serial.println(weatherMain);
-        Serial.print("Description: ");
-        Serial.println(weatherDescription);
-        Serial.print("Icon: ");
-        Serial.println(weatherIcon);
-
-        Serial.print("Base: ");
-        Serial.println(base);
-
-        Serial.print("Temperature: ");
-        Serial.println(temp);
-        Serial.print("Feels like: ");
-        Serial.println(feels_like);
-        Serial.print("Min Temp: ");
-        Serial.println(temp_min);
-        Serial.print("Max Temp: ");
-        Serial.println(temp_max);
-        Serial.print("Pressure: ");
-        Serial.println(pressure);
-        Serial.print("Humidity: ");
-        Serial.println(humidity);
-        Serial.print("Sea level: ");
-        Serial.println(sea_level);
-        Serial.print("Ground level: ");
-        Serial.println(grnd_level);
-
-        Serial.print("Visibility: ");
-        Serial.println(visibility);
-
-        Serial.print("Wind speed: ");
-        Serial.println(wind_speed);
-        Serial.print("Wind degree: ");
-        Serial.println(wind_deg);
-        Serial.print("Wind gust: ");
-        Serial.println(wind_gust);
-
-        Serial.print("Rain 1h: ");
-        Serial.println(rain_1h);
-
-        Serial.print("Clouds: ");
-        Serial.println(clouds_all);
-
-        Serial.print("Timestamp: ");
-        Serial.println(dt);
-
-        Serial.print("System type: ");
-        Serial.println(sys_type);
-        Serial.print("System ID: ");
-        Serial.println(sys_id);
-        Serial.print("Country: ");
-        Serial.println(sys_country);
-        Serial.print("Sunrise: ");
-        Serial.println(sunrise);
-        Serial.print("Sunset: ");
-        Serial.println(sunset);
-
-        Serial.print("Timezone (sec): ");
-        Serial.println(tzOffsetSeconds);
-
-        Serial.print("Location ID: ");
-        Serial.println(id);
-        Serial.print("Location Name: ");
-        Serial.println(name);
-
-        Serial.print("Status code: ");
-        Serial.println(cod);
-
-        // Keep what the weather page needs.
-        strlcpy(weather.city, name ? name : "?", sizeof(weather.city));
-        strlcpy(weather.country, sys_country ? sys_country : "", sizeof(weather.country));
-        strlcpy(weather.description, weatherDescription ? weatherDescription : "",
-                sizeof(weather.description));
-        weather.temp        = temp;
-        weather.feelsLike   = feels_like;
-        weather.pressure    = pressure;
-        weather.humidity    = humidity;
-        weather.clouds      = clouds_all;
-        weather.visibility  = visibility;
-        weather.windSpeed   = wind_speed;
-        weather.windGust    = wind_gust;
-        weather.windDeg     = wind_deg;
-        weather.rain1h      = rain_1h;
-        weather.sunrise     = sunrise;
-        weather.sunset      = sunset;
-        weather.fetchedUnix = timeClient.getEpochTime();
-        weather.valid       = true;
-
-        // Fold this observation into today's measured range, rolling over at
-        // local midnight.
-        {
-            time_t localNow = (time_t)(timeClient.getEpochTime() + (long)tOffset * 3600);
-            struct tm lt;
-            gmtime_r(&localNow, &lt);
-            if (lt.tm_yday != weatherObsDay)
-            {
-                weatherObsDay = lt.tm_yday;
-                weatherObsMin = temp;
-                weatherObsMax = temp;
-            }
-            else
-            {
-                if (temp < weatherObsMin) weatherObsMin = temp;
-                if (temp > weatherObsMax) weatherObsMax = temp;
-            }
-            if (!weather.dailyValid)
-            {
-                weather.tempMin = weatherObsMin;
-                weather.tempMax = weatherObsMax;
-            }
-        }
-        redrawWeatherPage   = true;
-
-        // Convert sunrise and sunset times to local time
-        long localSunrise = sunrise + (tOffset * 3600); // Adjust for local time (seconds)
-        long localSunset = sunset + (tOffset * 3600);   // Adjust for local time (seconds)
-
-        // Convert sunrise and sunset times to human-readable format
-        String sunriseTime = convertEpochToTimeString(localSunrise);
-        String sunsetTime = convertEpochToTimeString(localSunset);
-        String date = convertTimestampToDate(dt); // Convert to DD:MM:YY format
-        // Build the scrollText with the date, weather, sunrise, and sunset times
-        scrollText = String(name) + "     " + sys_country + "    " +
-                     date + "     " +
-                     "Tmp: " + String(temp, 1) + " C     " + // One decimal place for temp
-                     "RH: " + String(humidity) + "%" + "       " +
-                     "Pres: " + String(pressure) + "hPa" + "       " +
-                     String(weatherDescription) + "       " +
-                     "Sunrise: " + sunriseTime + "     " +
-                     "Sunset: " + sunsetTime;
-
-        scrollingText.drawString(scrollText, scrollingTextXposition, 0); // Draw text in sprite at position scrollingTextXposition
-        scrollingTextXposition = scrollingText.width();
-        Serial.println(scrollText);
-        APIkeyIsValid = true;
-    }
-    else
-    {
-        Serial.print("Error fetching weather data, HTTP code: ");
-        Serial.println(httpCode);
-        scrollText = "Sorry, No Weather Info At This Moment!!!            Have you enterred your API key?"; // Text to scroll
-        scrollingTextXposition = scrollingText.width();
-        APIkeyIsValid = false;
+        Serial.println("Open-Meteo: http begin failed");
+        weatherFetchOk = false;
         weather.valid = false;
         redrawWeatherPage = true;
+        return;
     }
 
+    int httpCode = http.GET();
+    String payload = (httpCode == HTTP_CODE_OK) ? http.getString() : String();
+
+    // Free the TLS session before parsing, not after.
     http.end();
+
+    if (httpCode != HTTP_CODE_OK || payload.isEmpty())
+    {
+        Serial.printf("Error fetching weather data, HTTP code: %d\n", httpCode);
+        scrollText = "Sorry, No Weather Info At This Moment!!!            Open-Meteo did not answer.";
+        scrollingTextXposition = scrollingText.width();
+        weatherFetchOk = false;
+        weather.valid = false;
+        redrawWeatherPage = true;
+        return;
+    }
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    payload = String();
+
+    if (err)
+    {
+        Serial.printf("Open-Meteo parse failed: %s\n", err.c_str());
+        weatherFetchOk = false;
+        weather.valid = false;
+        redrawWeatherPage = true;
+        return;
+    }
+
+    JsonObject cur = doc["current"];
+    JsonObject day = doc["daily"];
+    if (cur.isNull() || day.isNull())
+    {
+        Serial.println("Open-Meteo reply had no current block");
+        weatherFetchOk = false;
+        weather.valid = false;
+        redrawWeatherPage = true;
+        return;
+    }
+
+    // The offset comes with the weather, so daylight saving follows by itself.
+    int newOffset = (int)((long)(doc["utc_offset_seconds"] | 0) / 3600);
+    if (newOffset != tOffset)
+        Serial.printf("\U0001F570\uFE0F UTC offset %+d h (was %+d)\n", newOffset, tOffset);
+    tOffset = newOffset;
+
+    weather.temp      = cur["temperature_2m"] | 0.0f;
+    weather.feelsLike = cur["apparent_temperature"] | 0.0f;
+    weather.humidity  = cur["relative_humidity_2m"] | 0;
+    weather.pressure  = (int)(cur["pressure_msl"] | 0.0f);
+    weather.clouds    = cur["cloud_cover"] | 0;
+    weather.windSpeed = cur["wind_speed_10m"] | 0.0f;
+    weather.windGust  = cur["wind_gusts_10m"] | 0.0f;
+    weather.windDeg   = cur["wind_direction_10m"] | 0;
+    weather.rainMM    = cur["precipitation"] | 0.0f;
+
+    strlcpy(weather.windDir, windCompass(weather.windDeg), sizeof(weather.windDir));
+    strlcpy(weather.description, wmoDescription(cur["weather_code"] | -1),
+            sizeof(weather.description));
+
+    weather.tempMin    = day["temperature_2m_min"][0] | 0.0f;
+    weather.tempMax    = day["temperature_2m_max"][0] | 0.0f;
+    weather.dailyValid = true;
+
+    isoTimeOfDay(day["sunrise"][0] | "", weather.sunrise, sizeof(weather.sunrise));
+    isoTimeOfDay(day["sunset"][0] | "", weather.sunset, sizeof(weather.sunset));
+
+    // visibility is an hourly field; the query asks for a single hour of it.
+    weather.visibilityKm = (float)(doc["hourly"]["visibility"][0] | 0.0f) / 1000.0f;
+
+    weather.fetchedUnix = timeClient.getEpochTime();
+    weather.valid = true;
+    weatherFetchOk = true;
+    redrawWeatherPage = true;
+
+    Serial.printf("%s, %s: %.1f C (feels %.1f), %d%%RH, %d hPa, %s %.1f m/s (gust %.1f), today %.0f..%.0f C\n",
+                  weather.city, weather.country, weather.temp, weather.feelsLike,
+                  weather.humidity, weather.pressure, weather.windDir, weather.windSpeed,
+                  weather.windGust, weather.tempMin, weather.tempMax);
+
+    scrollText = String(weather.city) + "     " + weather.country + "    " +
+                 convertTimestampToDate(weather.fetchedUnix) + "     " +
+                 "Tmp: " + String(weather.temp, 1) + " C     " +
+                 "RH: " + String(weather.humidity) + "%" + "       " +
+                 "Pres: " + String(weather.pressure) + "hPa" + "       " +
+                 String(weather.description) + "       " +
+                 "Sunrise: " + weather.sunrise + "     " +
+                 "Sunset: " + weather.sunset;
+
+    scrollingText.drawString(scrollText, scrollingTextXposition, 0);
+    scrollingTextXposition = scrollingText.width();
+    Serial.println(scrollText);
 }
 
 // Function to format the local time from epoch time
@@ -1600,6 +1640,9 @@ void loadSettings()
     useScreenSaver = doc["useScreenSaver"] | useScreenSaver;
     bigClockColour = doc["bigClockColour"] | bigClockColour;
     bigClockShowsUtc = doc["bigClockShowsUtc"] | bigClockShowsUtc;
+    weatherIntervalMin = doc["weatherIntervalMin"] | weatherIntervalMin;
+    if (weatherIntervalMin < WEATHER_INTERVAL_MIN_LIMIT) weatherIntervalMin = WEATHER_INTERVAL_MIN_LIMIT;
+    if (weatherIntervalMin > WEATHER_INTERVAL_MAX_LIMIT) weatherIntervalMin = WEATHER_INTERVAL_MAX_LIMIT;
 
     Serial.println();
     Serial.println("-----------------------------------------------------------------");
@@ -1646,6 +1689,7 @@ void saveSettings()
     doc["useScreenSaver"] = useScreenSaver;
     doc["bigClockColour"] = bigClockColour;
     doc["bigClockShowsUtc"] = bigClockShowsUtc;
+    doc["weatherIntervalMin"] = weatherIntervalMin;
     doc["screenSaverTimeout"] = screenSaverTimeout;
 
     fs::File file = SPIFFS.open("/settings.json", "w");
@@ -1667,6 +1711,11 @@ void saveSettings()
     Serial.println(F("────────────────────────────────────────"));
     Serial.printf("🌍 Latitude           : %f\n", latitude);
     Serial.printf("🌍 Longitude          : %f\n", longitude);
+    {
+        char loc[10];
+        maidenhead(latitude, longitude, loc, sizeof(loc));
+        Serial.printf("   Locator            : %s\n", loc);
+    }
     Serial.printf("🕒 Local Time Color   : 0x%04X\n", localTimeColour);
     Serial.printf("🕒 UTC Time Color     : 0x%04X\n", utcTimeColour);
     Serial.printf("🕒 Big Time Color     : 0x%04X\n", bigClockColour);
@@ -1701,17 +1750,7 @@ void handleRoot()
     server.streamFile(file, "text/html");
     file.close();
 }
-void handleApiKeyPage()
-{
-    File file = SPIFFS.open("/apikey.html", "r");
-    if (!file)
-    {
-        server.send(404, "text/plain", "File not found");
-        return;
-    }
-    server.streamFile(file, "text/html");
-    file.close();
-}
+
 
 void handleSave()
 {
@@ -1820,8 +1859,41 @@ void drawOrredrawStaticElements()
 
     // 🟦 Local Time Label
 
+    // Both captions sit right of the frame's centre line.
+    const int LABEL_CX = 180;
+    const int LOCATOR_RIGHT = 312;
+
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawCentreString(localTimeLabel, 160, 76, 1);
+    tft.drawCentreString(localTimeLabel, LABEL_CX, 76, 1);
+
+    // The Maidenhead locator belongs to the QTH, so it goes on the caption row
+    // of the QTH frame, right-aligned inside it and in the caption own colour.
+    // The row is clear of the big digits, which stop above it.
+    {
+        char loc[10];
+        maidenhead(latitude, longitude, loc, sizeof(loc));
+
+        // Measured while the caption font is still the current one.
+        int labelRight = LABEL_CX + tft.textWidth(localTimeLabel) / 2;
+
+        // Eight characters next to the caption need a narrower face, and a
+        // lighter one reads as an annotation rather than a second caption.
+        // Drawn four pixels lower so the two share a baseline: the caption
+        // font carries 15 pixels of ascent against this one's 11.
+        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+        int locLeft = LOCATOR_RIGHT - tft.textWidth(loc);
+
+        // The caption is renamable from the web page, so check the two still
+        // clear each other rather than letting them collide.
+        if (locLeft > labelRight + 8)
+        {
+            tft.setTextDatum(TR_DATUM);
+            tft.drawString(loc, LOCATOR_RIGHT, 80);
+            tft.setTextDatum(TL_DATUM);
+        }
+
+        tft.setFreeFont(&Orbitron_Medium8pt7b);   // hand the font back
+    }
 
     // 🟥 UTC Frame
     tft.fillRect(0, 105, 320, 87, TFT_BLACK); // Clear previous frame
@@ -1835,7 +1907,7 @@ void drawOrredrawStaticElements()
     }
 
     // ⬜ UTC Label
-    tft.drawCentreString(utcTimeLabel, 160, 76 + 105, 1);
+    tft.drawCentreString(utcTimeLabel, LABEL_CX, 76 + 105, 1);
 }
 
 void mountAndListSPIFFS(uint8_t levels, bool listContent)
@@ -1991,6 +2063,15 @@ static void activatePage(uint8_t page)
     case 9:
         redrawWeatherPage = true;
         break;
+    case 10:
+        redrawBeaconPage = true;
+        break;
+    case 11:
+        redrawSunMoonPage = true;
+        break;
+    case 12:
+        redrawDxPage = true;
+        break;
     }
 }
 
@@ -2028,6 +2109,15 @@ void handleTouchToRotatePage()
                 tft.fillScreen(TFT_BLACK);
                 bigClockColonState = -1;
                 bigClockLabelDirty = true;
+                return;
+            }
+
+            // The DX page has a button of its own, and while its filter panel
+            // is up it owns every tap - otherwise a miss would page out from
+            // under the panel.
+            if (activePage == 12 && dxClusterHandleTouch((int16_t)x, (int16_t)y))
+            {
+                redrawDxPage = true;
                 return;
             }
 
@@ -2126,6 +2216,65 @@ void drawMainPropagationPage()
     tft.drawCentreString("UTC", 240, 179, 1);
 }
 
+// ---------------------------------------------------------------------------
+// Minimal reader for the solar XML.
+//
+// The document is a flat list of <tag>value</tag> plus two lists of elements
+// carrying attributes - about 1.6 kB in total.  tinyxml2 needed roughly 20 kB
+// of heap for it (three node pools, grown 4088 bytes at a time) and was failing
+// on one fetch in three once the rest of the firmware had taken its share.
+// Scanning the text costs nothing beyond the string already in hand.
+// ---------------------------------------------------------------------------
+
+// Start of the opening tag <name ...> , or -1.  Matches the whole tag name so
+// <sunspots> is not found by a search for <sun>.
+static int xmlFindTag(const String &src, const char *name, int from = 0)
+{
+    String open = String("<") + name;
+    int at = src.indexOf(open, from);
+    while (at >= 0)
+    {
+        char next = src.charAt(at + open.length());
+        if (next == '>' || next == ' ' || next == '\t' || next == '/' || next == '\r' || next == '\n')
+            return at;
+        at = src.indexOf(open, at + 1);
+    }
+    return -1;
+}
+
+// Text between <name ...> and </name>.  Empty when the tag is missing.
+static String xmlText(const String &src, const char *name, int from = 0)
+{
+    int at = xmlFindTag(src, name, from);
+    if (at < 0) return String();
+
+    int gt = src.indexOf('>', at);
+    if (gt < 0 || src.charAt(gt - 1) == '/') return String();
+
+    String close = String("</") + name + ">";
+    int end = src.indexOf(close, gt + 1);
+    if (end < 0) return String();
+
+    return src.substring(gt + 1, end);
+}
+
+// Value of attr="..." inside the tag opening at tagStart.
+static String xmlAttr(const String &src, int tagStart, const char *attr)
+{
+    int gt = src.indexOf('>', tagStart);
+    if (gt < 0) return String();
+
+    String key = String(" ") + attr + "=\"";
+    int at = src.indexOf(key, tagStart);
+    if (at < 0 || at > gt) return String();
+
+    at += key.length();
+    int quote = src.indexOf('"', at);
+    if (quote < 0 || quote > gt) return String();
+
+    return src.substring(at, quote);
+}
+
 void fetchSolarData()
 {
 
@@ -2141,22 +2290,23 @@ void fetchSolarData()
     }
 
     String payload = http.getString();
-    tinyxml2::XMLDocument doc;
-    doc.Parse(payload.c_str());
-    if (doc.ErrorID() != 0)
+
+    // Close the connection before touching the payload: an open TLS session
+    // holds tens of kilobytes of mbedTLS buffers.
+    http.end();
+
+    Serial.printf("Solar XML: %u bytes, 8-bit free=%u largest=%u\n",
+                  payload.length(),
+                  heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+    if (payload.length() < 100 || xmlFindTag(payload, "solardata") < 0)
     {
-        Serial.print("XML parse error: ");
-        Serial.println(doc.ErrorStr());
+        Serial.println("Solar XML looks wrong, skipping this cycle");
         return;
     }
 
-    tinyxml2::XMLElement *solardataXML = doc.RootElement()->FirstChildElement("solardata");
-
-    auto get = [&](const char *tag)
-    {
-        tinyxml2::XMLElement *e = solardataXML->FirstChildElement(tag);
-        return e && e->GetText() ? String(e->GetText()) : String("");
-    };
+    auto get = [&](const char *tag) { return xmlText(payload, tag); };
 
     // Assign fields to struct
     solarData.source = get("source");
@@ -2184,29 +2334,39 @@ void fetchSolarData()
 
     // Parse band conditions
     int bIndex = 0;
-    tinyxml2::XMLElement *band = solardataXML->FirstChildElement("calculatedconditions")->FirstChildElement("band");
-    while (band && bIndex < 8)
+    int scan = 0;
+    while (bIndex < 8)
     {
-        solarData.bandConditions[bIndex].name = band->Attribute("name");
-        solarData.bandConditions[bIndex].time = band->Attribute("time");
-        solarData.bandConditions[bIndex].condition = band->GetText();
-        band = band->NextSiblingElement("band");
+        int at = xmlFindTag(payload, "band", scan);
+        if (at < 0) break;
+        int gt = payload.indexOf('>', at);
+        int end = payload.indexOf("</band>", gt);
+        if (gt < 0 || end < 0) break;
+
+        solarData.bandConditions[bIndex].name = xmlAttr(payload, at, "name");
+        solarData.bandConditions[bIndex].time = xmlAttr(payload, at, "time");
+        solarData.bandConditions[bIndex].condition = payload.substring(gt + 1, end);
+        scan = end + 7;
         bIndex++;
     }
 
     // Parse VHF conditions
     int vIndex = 0;
-    tinyxml2::XMLElement *phen = solardataXML->FirstChildElement("calculatedvhfconditions")->FirstChildElement("phenomenon");
-    while (phen && vIndex < 5)
+    scan = 0;
+    while (vIndex < 5)
     {
-        solarData.vhfConditions[vIndex].name = phen->Attribute("name");
-        solarData.vhfConditions[vIndex].location = phen->Attribute("location");
-        solarData.vhfConditions[vIndex].condition = phen->GetText();
-        phen = phen->NextSiblingElement("phenomenon");
+        int at = xmlFindTag(payload, "phenomenon", scan);
+        if (at < 0) break;
+        int gt = payload.indexOf('>', at);
+        int end = payload.indexOf("</phenomenon>", gt);
+        if (gt < 0 || end < 0) break;
+
+        solarData.vhfConditions[vIndex].name = xmlAttr(payload, at, "name");
+        solarData.vhfConditions[vIndex].location = xmlAttr(payload, at, "location");
+        solarData.vhfConditions[vIndex].condition = payload.substring(gt + 1, end);
+        scan = end + 13;
         vIndex++;
     }
-
-    http.end();
 
     // --- Serial Debug Output ---
     Serial.println("\n=== Solar Data ===");
@@ -2673,6 +2833,45 @@ void drawWiFiSignalMeter(int qualityPercent)
 
 // Small badge under the big clock saying which time base is on screen.  It is
 // a touch target too - see handleTouchToRotatePage().
+// Maidenhead locator for a position.  Eight characters: the field (20 x 10
+// degrees), the square (2 x 1), the subsquare (5 x 2.5 arc-minutes) and the
+// extended square, which divides the subsquare ten ways again - about 460 by
+// 460 metres here.  Case follows the IARU convention: field upper, subsquare
+// lower.
+static void maidenhead(double latDeg, double lonDeg, char *out, size_t n)
+{
+    if (n < 9)
+    {
+        if (n) out[0] = 0;
+        return;
+    }
+
+    // The scheme is defined on a grid whose origin is the antimeridian at the
+    // south pole, so both angles are shifted positive first.
+    double lon = fmod(lonDeg + 180.0, 360.0);
+    if (lon < 0.0) lon += 360.0;
+
+    double lat = latDeg + 90.0;
+    if (lat < 0.0) lat = 0.0;
+    if (lat >= 180.0) lat = 179.999999;   // the pole itself has no square
+
+    // The subsquare index is kept as a real number, so the extended square is
+    // simply its fractional part.  That avoids a second modulus against a step
+    // like 1/24 of a degree, which binary floating point cannot hold exactly.
+    double lonSub = fmod(lon, 2.0) * 12.0;    // 0..24 across the square
+    double latSub = fmod(lat, 1.0) * 24.0;
+
+    out[0] = (char)('A' + (int)(lon / 20.0));
+    out[1] = (char)('A' + (int)(lat / 10.0));
+    out[2] = (char)('0' + (int)(fmod(lon, 20.0) / 2.0));
+    out[3] = (char)('0' + (int)fmod(lat, 10.0));
+    out[4] = (char)('a' + (int)lonSub);
+    out[5] = (char)('a' + (int)latSub);
+    out[6] = (char)('0' + (int)((lonSub - (int)lonSub) * 10.0));
+    out[7] = (char)('0' + (int)((latSub - (int)latSub) * 10.0));
+    out[8] = 0;
+}
+
 void drawBigClockModeBadge()
 {
     // No frame: just clear the strip so the previous label cannot show through.
@@ -2811,16 +3010,6 @@ static void drawDegreeMark(int x, int y, uint16_t colour)
     tft.drawCircle(x, y, 3, colour);
 }
 
-static const char *windCompass(int deg)
-{
-    static const char *pts[16] = {"N",  "NNE", "NE", "ENE", "E",  "ESE", "SE", "SSE",
-                                  "S",  "SSW", "SW", "WSW", "W",  "WNW", "NW", "NNW"};
-    while (deg < 0) deg += 360;
-    deg %= 360;
-    int idx = (int)((deg + 11.25) / 22.5) % 16;
-    return pts[idx];
-}
-
 static uint16_t temperatureColour(float c)
 {
     if (c < 0.0f)  return TFT_CYAN;
@@ -2829,14 +3018,6 @@ static uint16_t temperatureColour(float c)
     if (c < 28.0f) return TFT_YELLOW;
     if (c < 34.0f) return TFT_ORANGE;
     return TFT_RED;
-}
-
-static void formatLocalHM(long epochUtc, char *out, size_t n)
-{
-    time_t t = (time_t)(epochUtc + (long)tOffset * 3600);
-    struct tm tmv;
-    gmtime_r(&t, &tmv);
-    snprintf(out, n, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
 }
 
 // Layout constants (320x240, rotation 3).  y is the top of the text, which is
@@ -2866,8 +3047,8 @@ void drawWeatherPage()
     tft.drawString("WEATHER", WX_LLABEL, 2);
     tft.drawFastHLine(4, WX_RULE1, 312, TFT_DARKGREY);
 
-    // Without a working key there is nothing to show, so say what to do about it.
-    if (!APIkeyIsValid || !weather.valid)
+    // Open-Meteo needs no key, so the only way to be empty is a failed fetch.
+    if (!weather.valid)
     {
         tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
         tft.setTextColor(TFT_ORANGE, TFT_BLACK);
@@ -2875,17 +3056,14 @@ void drawWeatherPage()
 
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
         tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        tft.drawString(apiKey == "No API Key yet"
-                           ? "No OpenWeather API key is configured."
-                           : "The OpenWeather key was rejected.",
-                       10, 80);
-        tft.drawString("Enter a free key in the web interface:", 10, 104);
+        tft.drawString("Open-Meteo has not answered yet.", 10, 80);
+        tft.drawString("It is retried on the interval set at:", 10, 104);
 
         tft.setTextColor(TFT_CYAN, TFT_BLACK);
-        tft.drawString("http://hamclock.local/apikey.html", 10, 128);
+        tft.drawString("http://hamclock.local/weather.html", 10, 128);
 
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawString("Saving the key reboots the clock.", 10, 160);
+        tft.drawString("No account or API key is needed.", 10, 160);
         return;
     }
 
@@ -2938,7 +3116,7 @@ void drawWeatherPage()
     // Top row: the day's temperature range and the humidity.
     // Whole degrees: "-40/-30" is the widest this can get and still clears
     // the right-hand column.
-    if (weather.dailyValid || weatherObsDay >= 0)
+    if (weather.dailyValid)
         snprintf(val, sizeof(val), "%.0f/%.0f", weather.tempMin, weather.tempMax);
     else
         snprintf(val, sizeof(val), "-");
@@ -2951,7 +3129,7 @@ void drawWeatherPage()
     snprintf(val, sizeof(val), "%d %%", weather.clouds);
     cell(1, WX_RLABEL, WX_RVALUE, "Clouds", val);
 
-    snprintf(val, sizeof(val), "%.1f %s", weather.windSpeed, windCompass(weather.windDeg));
+    snprintf(val, sizeof(val), "%.1f %s", weather.windSpeed, weather.windDir);
     cell(2, WX_LLABEL, WX_LVALUE, "Wind m/s", val);
     if (weather.windGust > 0.05f)
         snprintf(val, sizeof(val), "%.1f", weather.windGust);
@@ -2959,19 +3137,17 @@ void drawWeatherPage()
         snprintf(val, sizeof(val), "-");
     cell(2, WX_RLABEL, WX_RVALUE, "Gust m/s", val);
 
-    snprintf(val, sizeof(val), "%.1f km", weather.visibility / 1000.0);
+    snprintf(val, sizeof(val), "%.0f km", weather.visibilityKm);
     cell(3, WX_LLABEL, WX_LVALUE, "Visib", val);
-    if (weather.rain1h > 0.005f)
-        snprintf(val, sizeof(val), "%.1f mm", weather.rain1h);
+    if (weather.rainMM > 0.005f)
+        snprintf(val, sizeof(val), "%.1f mm", weather.rainMM);
     else
         snprintf(val, sizeof(val), "-");
     cell(3, WX_RLABEL, WX_RVALUE, "Rain", val);
 
-    // Bottom row: the sun times.
-    formatLocalHM(weather.sunrise, val, sizeof(val));
-    cell(4, WX_LLABEL, WX_LVALUE, "Sunrise", val);
-    formatLocalHM(weather.sunset, val, sizeof(val));
-    cell(4, WX_RLABEL, WX_RVALUE, "Sunset", val);
+    // Bottom row: the sun times, already local and 24-hour.
+    cell(4, WX_LLABEL, WX_LVALUE, "Sunrise", weather.sunrise);
+    cell(4, WX_RLABEL, WX_RVALUE, "Sunset", weather.sunset);
 
     tft.drawFastHLine(4, WX_RULE3, 312, TFT_DARKGREY);
 
@@ -2995,7 +3171,7 @@ void updateWeatherPageClock()
     tft.drawString(buf, 314, 4);
     tft.setTextDatum(TL_DATUM);
 
-    if (!APIkeyIsValid || !weather.valid) return;
+    if (!weather.valid) return;
 
     long ageMin = ((long)timeClient.getEpochTime() - weather.fetchedUnix) / 60;
     if (ageMin < 0) ageMin = 0;
@@ -3006,6 +3182,489 @@ void updateWeatherPageClock()
     // requests are failing.
     tft.setTextColor(ageMin > 15 ? TFT_ORANGE : TFT_DARKGREY, TFT_BLACK);
     tft.drawString(padded, WX_LLABEL, WX_FOOT);
+}
+
+// =============================================================================
+// NCDXF/IARU beacon tracker (page 10)
+//
+// Eighteen beacons share five frequencies in a strictly timed round.  Each one
+// transmits for ten seconds, then steps up to the next band, so the whole set
+// repeats every three minutes.  The schedule is anchored to 00:00:00 UTC and
+// 180 divides a day exactly, which makes the unix epoch a usable clock for it:
+//
+//     slot   = (epoch % 180) / 10          0..17
+//     beacon = (slot - bandIndex) mod 18
+//
+// Nothing is fetched - accurate time and this table are the whole mechanism.
+// =============================================================================
+
+struct BeaconSite
+{
+    const char *call;
+    const char *location;   // kept to 12 characters, the width of its column
+};
+
+// Canonical transmission order.  Position in this list *is* the schedule, so
+// entries must not be reordered.
+static const BeaconSite beaconSites[18] = {
+    {"4U1UN",  "New York"},     {"VE8AT",  "Inuvik NWT"},  {"W6WX",   "California"},
+    {"KH6RS",  "Maui HI"},      {"ZL6B",   "Masterton"},   {"VK6RBP", "Rolystone"},
+    {"JA2IGY", "Mt Asama"},     {"RR9O",   "Novosibirsk"}, {"VR2B",   "Hong Kong"},
+    {"4S7B",   "Colombo"},      {"ZS6DN",  "Pretoria"},    {"5Z4B",   "Kariobangi"},
+    {"4X6TU",  "Tel Aviv"},     {"OH2B",   "Lohja"},       {"CS3B",   "Madeira"},
+    {"LU4AA",  "Buenos Aires"}, {"OA4B",   "Lima"},        {"YV5B",   "Caracas"}};
+
+struct BeaconBand
+{
+    const char *band;
+    const char *freq;
+};
+
+static const BeaconBand beaconBands[5] = {{"20m", "14.100"}, {"17m", "18.110"},
+                                          {"15m", "21.150"}, {"12m", "24.930"},
+                                          {"10m", "28.200"}};
+
+// Which beacon is on `band` at this instant, and which one takes over next.
+static uint8_t beaconAt(long epoch, uint8_t band)
+{
+    long slot = (epoch % 180L) / 10L;
+    return (uint8_t)(((slot - band) % 18 + 18) % 18);
+}
+
+static const int BX_BAND = 6;
+static const int BX_FREQ = 44;
+static const int BX_CALL = 100;
+static const int BX_LOC  = 156;
+static const int BX_NEXT = 258;
+
+static const int BX_RULE1 = 19;
+static const int BX_COLHDR = 26;
+static const int BX_RULE2 = 40;
+static const int BX_ROW0 = 52;
+static const int BX_ROWH = 28;
+static const int BX_RULE3 = 186;
+static const int BX_FOOT1 = 194;
+static const int BX_FOOT2 = 214;
+
+// =============================================================================
+// Sun and moon (page 11)
+//
+// Everything here is computed, not fetched: given the QTH and the time, the
+// ephemeris in lib/Sgp4 answers where both bodies are, when they cross the
+// horizon, and how much of the moon is lit.  The page therefore works with no
+// network at all, and it keeps working when Open-Meteo does not answer.
+//
+// The rise and set times are for the local calendar day, the window almanacs
+// use, so "today's sunset" stays on screen after it has passed rather than
+// jumping to tomorrow's.
+// =============================================================================
+
+static const int SM_RULE1  = 19;
+static const int SM_SUNHDR = 24;
+static const int SM_SROW0  = 42;
+static const int SM_RULE2  = 104;
+static const int SM_MOONHDR = 110;
+static const int SM_MROW0  = 128;
+static const int SM_ROWH   = 20;
+static const int SM_RULE3  = 208;
+static const int SM_FOOT   = 214;
+
+static const int SM_LLABEL = 8;
+static const int SM_LVALUE = 92;
+static const int SM_RLABEL = 168;
+static const int SM_RVALUE = 250;
+
+// Start of the local calendar day containing `utcNow`, as a unix time.
+static double localDayStart(long utcNow)
+{
+    long shift = (long)tOffset * 3600L;
+    long localNow = utcNow + shift;   // 'local' is a macro inside PNGdec
+    long day = localNow - ((localNow % 86400L) + 86400L) % 86400L;
+    return (double)(day - shift);
+}
+
+// "06:08" in local time, or "--:--" when the event does not happen.
+static void localHm(bool valid, double unixT, char *out, size_t n)
+{
+    if (!valid)
+    {
+        snprintf(out, n, "--:--");
+        return;
+    }
+    time_t t = (time_t)(unixT + (double)tOffset * 3600.0);
+    struct tm tm_;
+    gmtime_r(&t, &tm_);
+    snprintf(out, n, "%02d:%02d", tm_.tm_hour, tm_.tm_min);
+}
+
+static void hoursMinutes(double seconds, char *out, size_t n)
+{
+    if (seconds < 0) seconds = 0;
+    long m = (long)(seconds / 60.0);
+    snprintf(out, n, "%ldh%02ldm", m / 60, m % 60);
+}
+
+static const char *moonPhaseName(double frac, bool waxing)
+{
+    if (frac < 0.02) return "New moon";
+    if (frac > 0.98) return "Full moon";
+    if (fabs(frac - 0.5) < 0.03) return waxing ? "First quarter" : "Last quarter";
+    if (frac < 0.5) return waxing ? "Waxing crescent" : "Waning crescent";
+    return waxing ? "Waxing gibbous" : "Waning gibbous";
+}
+
+// The almanac part changes once a day, so it is worked out once and kept.
+struct SkyAlmanac
+{
+    long   dayKey = -1;          // local day this was computed for
+    sgp4::RiseSet sun;
+    sgp4::RiseSet moon;
+    double nextSunEvent = 0;     // next horizon crossing after "now"
+    bool   nextSunIsRise = false;
+    double nextMoonEvent = 0;
+    bool   nextMoonIsRise = false;
+    bool   haveNextSun = false, haveNextMoon = false;
+};
+
+static SkyAlmanac skyAlmanac;
+
+// Earliest rise or set still ahead of `nowUnix`.  Today may have none left,
+// which is why tomorrow is searched too.
+static bool nextSkyEvent(int body, double nowUnix, double dayStart,
+                         double latRad, double lonRad, double altKm,
+                         double &whenUnix, bool &isRise)
+{
+    bool found = false;
+    for (int d = 0; d < 2; d++)
+    {
+        sgp4::RiseSet rs;
+        sgp4::riseSet(body, dayStart + d * 86400.0, latRad, lonRad, altKm, rs);
+
+        const double cands[2] = {rs.riseUnix, rs.setUnix};
+        const bool   valid[2] = {rs.riseValid, rs.setValid};
+        for (int k = 0; k < 2; k++)
+        {
+            if (!valid[k] || cands[k] <= nowUnix) continue;
+            if (!found || cands[k] < whenUnix)
+            {
+                whenUnix = cands[k];
+                isRise = (k == 0);
+                found = true;
+            }
+        }
+        if (found) break;   // today's events, if any remain, always win
+    }
+    return found;
+}
+
+static void refreshSkyAlmanac(double nowUnix, bool force)
+{
+    double dayStart = localDayStart((long)nowUnix);
+    long key = (long)(dayStart / 86400.0);
+
+    // The rise and set times only change at local midnight, but the countdown
+    // has to be re-aimed the moment the event it was counting to goes by -
+    // otherwise it sits at zero until midnight.
+    bool dayChanged = (key != skyAlmanac.dayKey);
+    bool sunPassed  = skyAlmanac.haveNextSun  && nowUnix >= skyAlmanac.nextSunEvent;
+    bool moonPassed = skyAlmanac.haveNextMoon && nowUnix >= skyAlmanac.nextMoonEvent;
+    if (!force && !dayChanged && !sunPassed && !moonPassed) return;
+
+    double latRad = latitude * DEG_TO_RAD;
+    double lonRad = longitude * DEG_TO_RAD;
+    double altKm  = satellitesSiteAltitudeM() / 1000.0;
+
+    if (force || dayChanged)
+    {
+        sgp4::riseSet(sgp4::SKY_SUN,  dayStart, latRad, lonRad, altKm, skyAlmanac.sun);
+        sgp4::riseSet(sgp4::SKY_MOON, dayStart, latRad, lonRad, altKm, skyAlmanac.moon);
+    }
+
+    skyAlmanac.haveNextSun = nextSkyEvent(sgp4::SKY_SUN, nowUnix, dayStart,
+                                          latRad, lonRad, altKm,
+                                          skyAlmanac.nextSunEvent, skyAlmanac.nextSunIsRise);
+    skyAlmanac.haveNextMoon = nextSkyEvent(sgp4::SKY_MOON, nowUnix, dayStart,
+                                           latRad, lonRad, altKm,
+                                           skyAlmanac.nextMoonEvent, skyAlmanac.nextMoonIsRise);
+    skyAlmanac.dayKey = key;
+}
+
+void drawSunMoonPage(bool fullRedraw)
+{
+    static long lastSecond = -1;
+
+    long utcNow = (long)timeClient.getEpochTime();
+    if (!fullRedraw && utcNow == lastSecond) return;
+    lastSecond = utcNow;
+
+    if (fullRedraw)
+    {
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextDatum(TL_DATUM);
+
+        tft.setFreeFont(&Orbitron_Medium8pt7b);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.drawString("SUN & MOON", SM_LLABEL, 2);
+        tft.drawFastHLine(4, SM_RULE1, 312, TFT_DARKGREY);
+
+        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.drawString("SUN", SM_LLABEL, SM_SUNHDR);
+        tft.drawFastHLine(4, SM_RULE2, 312, TFT_DARKGREY);
+        tft.setTextColor(TFT_SILVER, TFT_BLACK);
+        tft.drawString("MOON", SM_LLABEL, SM_MOONHDR);
+        tft.drawFastHLine(4, SM_RULE3, 312, TFT_DARKGREY);
+
+        // Labels never change; only the values are repainted each second.
+        tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        const char *sunLabels[3][2] = {{"Elevation", "Azimuth"},
+                                       {"Rise", "Set"},
+                                       {"Grey line", "Day len"}};
+        for (int r = 0; r < 3; r++)
+        {
+            tft.drawString(sunLabels[r][0], SM_LLABEL, SM_SROW0 + r * SM_ROWH);
+            tft.drawString(sunLabels[r][1], SM_RLABEL, SM_SROW0 + r * SM_ROWH);
+        }
+        const char *moonLabels[4][2] = {{"Elevation", "Azimuth"},
+                                        {"Rise", "Set"},
+                                        {"Illum", "Dist km"},
+                                        {"Phase", ""}};
+        for (int r = 0; r < 4; r++)
+        {
+            tft.drawString(moonLabels[r][0], SM_LLABEL, SM_MROW0 + r * SM_ROWH);
+            if (moonLabels[r][1][0])
+                tft.drawString(moonLabels[r][1], SM_RLABEL, SM_MROW0 + r * SM_ROWH);
+        }
+    }
+
+    refreshSkyAlmanac((double)utcNow, fullRedraw);
+
+    double latRad = latitude * DEG_TO_RAD;
+    double lonRad = longitude * DEG_TO_RAD;
+    double altKm  = satellitesSiteAltitudeM() / 1000.0;
+    double jd = sgp4::jdFromUnix((double)utcNow);
+
+    double rsun[3], sunAz, sunEl, sunRange;
+    sgp4::sunEci(jd, rsun);
+    sgp4::topocentric(rsun, jd, latRad, lonRad, altKm, sunAz, sunEl, sunRange);
+
+    sgp4::MoonInfo moon;
+    sgp4::moonInfo(jd, latRad, lonRad, altKm, moon);
+
+    char val[24];
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+    tft.setTextDatum(TL_DATUM);
+
+    // Values are padded to a fixed width so the opaque background wipes what
+    // was there before - no flicker from clearing rectangles first.
+    auto value = [&](int x, int y, const char *text, uint16_t colour)
+    {
+        char padded[24];
+        snprintf(padded, sizeof(padded), "%-8.8s", text);
+        tft.setTextColor(colour, TFT_BLACK);
+        tft.drawString(padded, x, y);
+    };
+
+    // A degree mark after a number that has just been drawn 8 px per character.
+    auto degreeAfter = [&](int x, int y, const char *text, uint16_t colour)
+    {
+        drawDegreeMark(x + (int)strlen(text) * 8 + 4, y + 6, colour);
+    };
+
+    // --- sun ----------------------------------------------------------------
+    uint16_t sunColour = (sunEl >= 0.0) ? TFT_YELLOW : TFT_DARKGREY;
+
+    snprintf(val, sizeof(val), "%+.1f", sunEl);
+    value(SM_LVALUE, SM_SROW0, val, sunColour);
+    degreeAfter(SM_LVALUE, SM_SROW0, val, sunColour);
+
+    snprintf(val, sizeof(val), "%.1f", sunAz);
+    value(SM_RVALUE, SM_SROW0, val, TFT_WHITE);
+    degreeAfter(SM_RVALUE, SM_SROW0, val, TFT_WHITE);
+
+    localHm(skyAlmanac.sun.riseValid, skyAlmanac.sun.riseUnix, val, sizeof(val));
+    value(SM_LVALUE, SM_SROW0 + SM_ROWH, val, TFT_WHITE);
+    localHm(skyAlmanac.sun.setValid, skyAlmanac.sun.setUnix, val, sizeof(val));
+    value(SM_RVALUE, SM_SROW0 + SM_ROWH, val, TFT_WHITE);
+
+    // Grey line: the band around sunrise and sunset when the terminator runs
+    // through the path and the low bands open up over very long distances.
+    bool greyLine = fabs(sunEl) <= 6.0;
+    value(SM_LVALUE, SM_SROW0 + 2 * SM_ROWH, greyLine ? "YES" : "no",
+          greyLine ? TFT_GREEN : TFT_DARKGREY);
+
+    if (skyAlmanac.sun.riseValid && skyAlmanac.sun.setValid)
+        hoursMinutes(skyAlmanac.sun.setUnix - skyAlmanac.sun.riseUnix, val, sizeof(val));
+    else
+        snprintf(val, sizeof(val), "-");
+    value(SM_RVALUE, SM_SROW0 + 2 * SM_ROWH, val, TFT_WHITE);
+
+    // --- moon ---------------------------------------------------------------
+    uint16_t moonColour = (moon.elDeg >= 0.0) ? TFT_SILVER : TFT_DARKGREY;
+
+    snprintf(val, sizeof(val), "%+.1f", moon.elDeg);
+    value(SM_LVALUE, SM_MROW0, val, moonColour);
+    degreeAfter(SM_LVALUE, SM_MROW0, val, moonColour);
+
+    snprintf(val, sizeof(val), "%.1f", moon.azDeg);
+    value(SM_RVALUE, SM_MROW0, val, TFT_WHITE);
+    degreeAfter(SM_RVALUE, SM_MROW0, val, TFT_WHITE);
+
+    localHm(skyAlmanac.moon.riseValid, skyAlmanac.moon.riseUnix, val, sizeof(val));
+    value(SM_LVALUE, SM_MROW0 + SM_ROWH, val, TFT_WHITE);
+    localHm(skyAlmanac.moon.setValid, skyAlmanac.moon.setUnix, val, sizeof(val));
+    value(SM_RVALUE, SM_MROW0 + SM_ROWH, val, TFT_WHITE);
+
+    snprintf(val, sizeof(val), "%.0f %%", moon.illuminatedFrac * 100.0);
+    value(SM_LVALUE, SM_MROW0 + 2 * SM_ROWH, val, TFT_WHITE);
+    snprintf(val, sizeof(val), "%.0f", moon.distanceKm);
+    value(SM_RVALUE, SM_MROW0 + 2 * SM_ROWH, val, TFT_WHITE);
+
+    // The phase name is wider than a value column, and nothing sits to its
+    // right, so it is drawn on its own with the age tacked on the end.
+    char phase[32], padded[40];
+    snprintf(phase, sizeof(phase), "%s  %.1f d",
+             moonPhaseName(moon.illuminatedFrac, moon.waxing), moon.ageDays);
+    snprintf(padded, sizeof(padded), "%-28.28s", phase);
+    tft.setTextColor(TFT_SILVER, TFT_BLACK);
+    tft.drawString(padded, SM_LVALUE, SM_MROW0 + 3 * SM_ROWH);
+
+    // --- countdown footer ---------------------------------------------------
+    char sunPart[24] = "", moonPart[24] = "", foot[48], footPad[48];
+    if (skyAlmanac.haveNextSun)
+    {
+        char d[12];
+        hoursMinutes(skyAlmanac.nextSunEvent - (double)utcNow, d, sizeof(d));
+        snprintf(sunPart, sizeof(sunPart), "%s %s",
+                 skyAlmanac.nextSunIsRise ? "Sunrise" : "Sunset", d);
+    }
+    if (skyAlmanac.haveNextMoon)
+    {
+        char d[12];
+        hoursMinutes(skyAlmanac.nextMoonEvent - (double)utcNow, d, sizeof(d));
+        snprintf(moonPart, sizeof(moonPart), "%s %s",
+                 skyAlmanac.nextMoonIsRise ? "Moonrise" : "Moonset", d);
+    }
+    snprintf(foot, sizeof(foot), "%s   %s", sunPart, moonPart);
+    snprintf(footPad, sizeof(footPad), "%-38.38s", foot);
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString(footPad, SM_LLABEL, SM_FOOT);
+
+    // Local time top right, so the rise and set columns read unambiguously.
+    time_t lt = (time_t)(utcNow + tOffset * 3600L);
+    struct tm tm_;
+    gmtime_r(&lt, &tm_);
+    snprintf(val, sizeof(val), "%02d:%02d:%02d QTH", tm_.tm_hour, tm_.tm_min, tm_.tm_sec);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(val, 314, 4);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawBeaconPage(bool fullRedraw)
+{
+    static long lastSlot = -1;
+    static long lastSecond = -1;
+
+    long epoch = (long)timeClient.getEpochTime();
+    long slot = (epoch % 180L) / 10L;
+
+    if (fullRedraw)
+    {
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextDatum(TL_DATUM);
+
+        tft.setFreeFont(&Orbitron_Medium8pt7b);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.drawString("NCDXF BEACONS", BX_BAND, 2);
+        tft.drawFastHLine(4, BX_RULE1, 312, TFT_DARKGREY);
+
+        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("BAND", BX_BAND, BX_COLHDR);
+        tft.drawString("FREQ", BX_FREQ, BX_COLHDR);
+        tft.drawString("CALL", BX_CALL, BX_COLHDR);
+        tft.drawString("LOCATION", BX_LOC, BX_COLHDR);
+        tft.drawString("NEXT", BX_NEXT, BX_COLHDR);
+        tft.drawFastHLine(4, BX_RULE2, 312, TFT_DARKGREY);
+        tft.drawFastHLine(4, BX_RULE3, 312, TFT_DARKGREY);
+
+        // The band and frequency columns never change.
+        tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+        for (uint8_t b = 0; b < 5; b++)
+        {
+            int y = BX_ROW0 + b * BX_ROWH;
+            tft.setTextColor(TFT_CYAN, TFT_BLACK);
+            tft.drawString(beaconBands[b].band, BX_BAND, y);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.drawString(beaconBands[b].freq, BX_FREQ, y);
+        }
+
+        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("call @22wpm then 100/10/1/0.1 W dashes", BX_BAND, BX_FOOT2);
+
+        lastSlot = -1;      // force the callsigns to be painted
+        lastSecond = -1;
+    }
+
+    // Callsigns only move every ten seconds.
+    if (slot != lastSlot)
+    {
+        lastSlot = slot;
+        tft.setTextDatum(TL_DATUM);
+        tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+
+        for (uint8_t b = 0; b < 5; b++)
+        {
+            int y = BX_ROW0 + b * BX_ROWH;
+            const BeaconSite &now = beaconSites[beaconAt(epoch, b)];
+            const BeaconSite &next = beaconSites[beaconAt(epoch + 10, b)];
+
+            char buf[16];
+
+            snprintf(buf, sizeof(buf), "%-6.6s", now.call);
+            tft.setTextColor(TFT_GREEN, TFT_BLACK);
+            tft.drawString(buf, BX_CALL, y);
+
+            snprintf(buf, sizeof(buf), "%-12.12s", now.location);
+            tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+            tft.drawString(buf, BX_LOC, y);
+
+            snprintf(buf, sizeof(buf), "%-6.6s", next.call);
+            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.drawString(buf, BX_NEXT, y);
+        }
+    }
+
+    if (epoch != lastSecond)
+    {
+        lastSecond = epoch;
+
+        struct tm tm_;
+        time_t t = (time_t)epoch;
+        gmtime_r(&t, &tm_);
+
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d UTC", tm_.tm_hour, tm_.tm_min, tm_.tm_sec);
+        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString(buf, 314, 4);
+        tft.setTextDatum(TL_DATUM);
+
+        long into = epoch % 10L;
+        char foot[48];
+        snprintf(foot, sizeof(foot), "CW  %lds in slot  next %lds  round %ld/18",
+                 into, 10 - into, slot + 1);
+        // Fixed width, hard-truncated: 38 characters is what the row holds.
+        char padded[48];
+        snprintf(padded, sizeof(padded), "%-38.38s", foot);
+        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.drawString(padded, BX_BAND, BX_FOOT1);
+    }
 }
 
 void drawQRCode(const char *text, int x, int y, int scale)
@@ -3067,17 +3726,21 @@ void handleSaveCaptivePortal()
 {
     Serial.println("Saving");
 
-    if (server.hasArg("ssid") && server.hasArg("password") && server.hasArg("time"))
-    {
-        String ssid = server.arg("ssid");
-        String pass = server.arg("password");
-        String timeStr = server.arg("time"); // JSON string: {"localTime":"15:42","offset":120}
+    // Networks are added one at a time through /wifiadd; this finishes the
+    // session: remember the phone's clock and reboot into station mode.
+    if (server.hasArg("ssid") && server.arg("ssid").length())
+        wifiNetAdd(server.arg("ssid"),
+                   server.hasArg("password") ? server.arg("password") : String(""));
 
-        // --- Save WiFi ---
-        prefs.begin("wifi", false);
-        prefs.putString("ssid", ssid);
-        prefs.putString("pass", pass);
-        prefs.end();
+    if (wifiNetCount() == 0)
+    {
+        server.send(400, "text/plain", "Add at least one network first.");
+        return;
+    }
+
+    if (server.hasArg("time"))
+    {
+        String timeStr = server.arg("time");
 
         // --- Parse JSON from "time" ---
         JsonDocument doc;
@@ -3106,13 +3769,11 @@ void handleSaveCaptivePortal()
             prefs.end();
         }
 
-        server.send_P(200, "text/html", html_success);
-        ESP.restart();
     }
-    else
-    {
-        server.send(400, "text/plain", "Missing fields.");
-    }
+
+    server.send_P(200, "text/html", html_success);
+    delay(500);
+    ESP.restart();
 }
 
 void startConfigurationPortal()
@@ -3136,6 +3797,9 @@ void startConfigurationPortal()
     server.on("/", handleRootCaptivePortal);
     server.on("/scan", handleScanCaptivePortal);
     server.on("/save", HTTP_POST, handleSaveCaptivePortal);
+    wifiRegisterRoutes();
+    // The portal has no internet, but the theme is on the device itself.
+    server.serveStatic("/hamclock.css", SPIFFS, "/hamclock.css");
     server.onNotFound([]()
                       {
     Serial.print("Unknown request: ");
@@ -3148,57 +3812,278 @@ void startConfigurationPortal()
     Serial.println("🚀 Web server started.");
 }
 
+// =============================================================================
+// Saved WiFi networks
+//
+// Preferences namespace "wifi": "n" holds the count, "s0".."s4" / "p0".."p4"
+// the credentials.  The single "ssid"/"pass" pair older firmware wrote is
+// migrated into slot 0 on first use.
+// =============================================================================
+#define WIFI_MAX_NETS 5
+
+static void wifiMigrateLegacy()
+{
+    prefs.begin("wifi", false);
+    if (prefs.getUChar("n", 0xFF) == 0xFF)
+    {
+        String s = prefs.getString("ssid", "");
+        String p = prefs.getString("pass", "");
+        if (s.length())
+        {
+            prefs.putString("s0", s);
+            prefs.putString("p0", p);
+            prefs.putUChar("n", 1);
+            Serial.printf("\U0001F4F6 Migrated saved network '%s' into the list\n", s.c_str());
+        }
+        else
+        {
+            prefs.putUChar("n", 0);
+        }
+    }
+    prefs.end();
+}
+
+static uint8_t wifiNetCount()
+{
+    prefs.begin("wifi", true);
+    uint8_t n = prefs.getUChar("n", 0);
+    prefs.end();
+    return n > WIFI_MAX_NETS ? WIFI_MAX_NETS : n;
+}
+
+static void wifiNetGet(uint8_t i, String &ssid, String &pass)
+{
+    char ks[8], kp[8];
+    snprintf(ks, sizeof(ks), "s%u", i);
+    snprintf(kp, sizeof(kp), "p%u", i);
+    prefs.begin("wifi", true);
+    ssid = prefs.getString(ks, "");
+    pass = prefs.getString(kp, "");
+    prefs.end();
+}
+
+// Adding an SSID that is already stored replaces its password and keeps its
+// place in the list.  Returns false only when the list is full.
+static bool wifiNetAdd(const String &ssid, const String &pass)
+{
+    if (ssid.isEmpty()) return false;
+
+    prefs.begin("wifi", false);
+    uint8_t n = prefs.getUChar("n", 0);
+    if (n > WIFI_MAX_NETS) n = WIFI_MAX_NETS;
+
+    int slot = -1;
+    for (uint8_t i = 0; i < n; i++)
+    {
+        char ks[8];
+        snprintf(ks, sizeof(ks), "s%u", i);
+        if (prefs.getString(ks, "") == ssid) { slot = i; break; }
+    }
+    if (slot < 0)
+    {
+        if (n >= WIFI_MAX_NETS) { prefs.end(); return false; }
+        slot = n++;
+    }
+
+    char ks[8], kp[8];
+    snprintf(ks, sizeof(ks), "s%d", slot);
+    snprintf(kp, sizeof(kp), "p%d", slot);
+    prefs.putString(ks, ssid);
+    prefs.putString(kp, pass);
+    prefs.putUChar("n", n);
+    prefs.end();
+    return true;
+}
+
+static bool wifiNetRemove(const String &ssid)
+{
+    prefs.begin("wifi", false);
+    uint8_t n = prefs.getUChar("n", 0);
+    if (n > WIFI_MAX_NETS) n = WIFI_MAX_NETS;
+
+    int slot = -1;
+    for (uint8_t i = 0; i < n; i++)
+    {
+        char ks[8];
+        snprintf(ks, sizeof(ks), "s%u", i);
+        if (prefs.getString(ks, "") == ssid) { slot = i; break; }
+    }
+    if (slot < 0) { prefs.end(); return false; }
+
+    // Close the gap so the list stays contiguous.
+    for (uint8_t i = slot; i + 1 < n; i++)
+    {
+        char ks[8], kp[8], ks2[8], kp2[8];
+        snprintf(ks,  sizeof(ks),  "s%u", i);
+        snprintf(kp,  sizeof(kp),  "p%u", i);
+        snprintf(ks2, sizeof(ks2), "s%u", i + 1);
+        snprintf(kp2, sizeof(kp2), "p%u", i + 1);
+        prefs.putString(ks, prefs.getString(ks2, ""));
+        prefs.putString(kp, prefs.getString(kp2, ""));
+    }
+    prefs.putUChar("n", (uint8_t)(n - 1));
+    prefs.end();
+    return true;
+}
+
+// The same four endpoints back both the captive portal and /wifi.html, so the
+// two never drift apart.
+static void wifiRegisterRoutes()
+{
+    server.on("/wifilist", HTTP_GET, []()
+              {
+        JsonDocument doc;
+        doc["max"] = WIFI_MAX_NETS;
+        doc["connected"] = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : String("");
+        JsonArray arr = doc["nets"].to<JsonArray>();
+        uint8_t n = wifiNetCount();
+        for (uint8_t i = 0; i < n; i++) {
+            String ssid, pass;
+            wifiNetGet(i, ssid, pass);
+            JsonObject o = arr.add<JsonObject>();
+            o["ssid"] = ssid;
+            o["hasPass"] = pass.length() > 0;
+        }
+        String out;
+        serializeJson(doc, out);
+        server.send(200, "application/json", out); });
+
+    server.on("/wifiadd", HTTP_POST, []()
+              {
+        JsonDocument doc;
+        if (!server.hasArg("plain") || deserializeJson(doc, server.arg("plain"))) {
+            server.send(400, "application/json", "{\"error\":\"bad json\"}");
+            return;
+        }
+        String ssid = doc["ssid"] | "";
+        String pass = doc["pass"] | "";
+        if (ssid.isEmpty()) {
+            server.send(400, "application/json", "{\"error\":\"missing ssid\"}");
+            return;
+        }
+        if (!wifiNetAdd(ssid, pass)) {
+            server.send(409, "application/json", "{\"error\":\"list full\"}");
+            return;
+        }
+        Serial.printf("\U0001F4F6 Saved network '%s'\n", ssid.c_str());
+        server.send(200, "application/json", "{\"status\":\"ok\"}"); });
+
+    server.on("/wifidel", HTTP_POST, []()
+              {
+        JsonDocument doc;
+        if (!server.hasArg("plain") || deserializeJson(doc, server.arg("plain"))) {
+            server.send(400, "application/json", "{\"error\":\"bad json\"}");
+            return;
+        }
+        String ssid = doc["ssid"] | "";
+        if (!wifiNetRemove(ssid)) {
+            server.send(404, "application/json", "{\"error\":\"not found\"}");
+            return;
+        }
+        Serial.printf("\U0001F4F6 Removed network '%s'\n", ssid.c_str());
+        server.send(200, "application/json", "{\"status\":\"ok\"}"); });
+
+    server.on("/wifiscan", HTTP_GET, []()
+              {
+        WiFi.scanDelete();
+        int n = WiFi.scanNetworks();
+        JsonDocument doc;
+        JsonArray arr = doc.to<JsonArray>();
+        for (int i = 0; i < n; i++) {
+            JsonObject o = arr.add<JsonObject>();
+            o["ssid"] = WiFi.SSID(i);
+            o["rssi"] = WiFi.RSSI(i);
+            o["open"] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        }
+        String out;
+        serializeJson(doc, out);
+        server.send(200, "application/json", out); });
+}
+
 bool tryToConnectSavedWiFi()
 {
-    Serial.println("🔍 Attempting to load saved WiFi credentials...");
+    wifiMigrateLegacy();
 
-    prefs.begin("wifi", true);
-    String ssid = prefs.getString("ssid", "");
-    String pass = prefs.getString("pass", "");
-    prefs.end();
-
-    if (ssid.isEmpty() || pass.isEmpty())
+    uint8_t netCount = wifiNetCount();
+    Serial.printf("🔍 %u saved network(s)\n", netCount);
+    if (netCount == 0)
     {
         Serial.println("⚠️ No saved credentials found.");
         return false;
     }
 
-    Serial.printf("📡 Found SSID: %s\n", ssid.c_str());
-    Serial.printf("🔐 Found Password: %s\n", pass.c_str());
+    // Scan first: trying a network that is not even in range wastes the whole
+    // per-network timeout, and the strongest one is the one worth trying first.
+    WiFi.mode(WIFI_STA);
+    WiFi.scanDelete();
+    int found = WiFi.scanNetworks();
+    Serial.printf("📡 %d network(s) in range\n", found);
 
-    Serial.printf("🔌 Connecting to WiFi: %s...\n", ssid.c_str());
-    WiFi.begin(ssid.c_str(), pass.c_str());
-
-    for (int i = 0; i < 40; i++) // wait up to ~20s
+    struct Cand { uint8_t idx; int rssi; };
+    Cand order[WIFI_MAX_NETS];
+    for (uint8_t i = 0; i < netCount; i++)
     {
-        if (WiFi.status() == WL_CONNECTED)
-        {
-            Serial.println("✅ Connected to WiFi!");
-            Serial.print("📶 IP Address: ");
-            Serial.println(WiFi.localIP());
-
-            // 👉 Override DNS after DHCP has completed
-            IPAddress dns2(8, 8, 8, 8);
-            IPAddress dns1(1, 1, 1, 1);
-            if (!WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2))
-            {
-                Serial.println("⚠️ Failed to set DNS servers.");
-            }
-
-            Serial.print("🌍 DNS #1: ");
-            Serial.println(WiFi.dnsIP(0));
-            Serial.print("🌍 DNS #2: ");
-            Serial.println(WiFi.dnsIP(1));
-            return true;
-        }
-        Serial.print(".");
-        delay(500);
+        String s, p;
+        wifiNetGet(i, s, p);
+        order[i].idx = i;
+        order[i].rssi = -999;
+        for (int j = 0; j < found; j++)
+            if (WiFi.SSID(j) == s && WiFi.RSSI(j) > order[i].rssi)
+                order[i].rssi = WiFi.RSSI(j);
+    }
+    for (uint8_t i = 1; i < netCount; i++)   // strongest first
+    {
+        Cand key = order[i];
+        int j = i - 1;
+        while (j >= 0 && order[j].rssi < key.rssi) { order[j + 1] = order[j]; j--; }
+        order[j + 1] = key;
     }
 
-    Serial.println("\n❌ Failed to connect to saved WiFi.");
-  
-  WiFi.disconnect(true);
-    startConfigurationPortal();
+    for (uint8_t c = 0; c < netCount; c++)
+    {
+        String ssid, pass;
+        wifiNetGet(order[c].idx, ssid, pass);
+        if (ssid.isEmpty()) continue;
+
+        bool inRange = order[c].rssi > -999;
+        int  attempts = inRange ? 24 : 10;   // 12 s if seen, 5 s for a hidden SSID
+
+        Serial.printf("🔌 Connecting to '%s' (%s)...\n", ssid.c_str(),
+                      inRange ? "in range" : "not seen in scan");
+        WiFi.begin(ssid.c_str(), pass.c_str());
+
+        for (int i = 0; i < attempts; i++)
+        {
+            if (WiFi.status() == WL_CONNECTED)
+            {
+                Serial.printf("✅ Connected to '%s'\n", ssid.c_str());
+                Serial.print("📶 IP Address: ");
+                Serial.println(WiFi.localIP());
+
+                // 👉 Override DNS after DHCP has completed
+                IPAddress dns2(8, 8, 8, 8);
+                IPAddress dns1(1, 1, 1, 1);
+                if (!WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2))
+                {
+                    Serial.println("⚠️ Failed to set DNS servers.");
+                }
+
+                Serial.print("🌍 DNS #1: ");
+                Serial.println(WiFi.dnsIP(0));
+                Serial.print("🌍 DNS #2: ");
+                Serial.println(WiFi.dnsIP(1));
+                return true;
+            }
+            Serial.print(".");
+            delay(500);
+        }
+
+        Serial.println();
+        WiFi.disconnect(true);
+        delay(200);
+    }
+
+    Serial.println("❌ None of the saved networks worked.");
     return false;
 }
 
@@ -3313,36 +4198,10 @@ void checkIfscreenIsTouchedDuringStartUpForFactoryReset()
         }
     }
 }
-void handleSaveApiKey()
-{
-    if (server.hasArg("key"))
-    {
-        String apiKey = server.arg("key");
-        prefs.begin("config", false);
-        prefs.putString("ow_api_key", apiKey);
-        prefs.end();
-        server.send(200, "text/plain", "API key saved");
-        delay(1000);
-        esp_restart();  }
-    else
-    {
-        server.send(400, "text/plain", "Missing key");
-    }
-}
 
-void handleGetApiKey()
-{
-    prefs.begin("config", true);
-    apiKey = prefs.getString("ow_api_key", "No API Key yet");
-    prefs.end();
-    server.send(200, "text/plain", apiKey);
-}
-void retrieveAPIkeyFromPref()
-{
-    prefs.begin("config", true);
-    apiKey = prefs.getString("ow_api_key", "No API Key yet");
-    prefs.end();
-}
+
+
+
 
 void tryToRetrieveUTCoffsetFromFirstConfiguration()
 {

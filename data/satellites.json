@@ -1,0 +1,14 @@
+{
+  "minElevation": 5,
+  "horizonDays": 3,
+  "tleRefreshHours": 12,
+  "useLocalTime": true,
+  "altitudeM": 150,
+  "sats": [
+    25544,
+    43678,
+    40908,
+    43017,
+    57166
+  ]
+}

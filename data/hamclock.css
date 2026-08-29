@@ -1,0 +1,160 @@
+/* ---------------------------------------------------------------------------
+   Shared look for every HamClock page.  Loaded after Bootstrap, so the rules
+   here win where they need to.  Page-specific styling stays in the page.
+   --------------------------------------------------------------------------- */
+:root {
+    --hc-bg:     #121212;
+    --hc-nav:    #171717;
+    --hc-card:   #1e1e1e;
+    --hc-line:   #333;
+    --hc-text:   #e0e0e0;
+    --hc-bright: #f2f5f8;
+    --hc-muted:  #aab6c2;   /* 8:1 on the card background; Bootstrap's own
+                               secondary is #6c757d, only 3.6:1 */
+    --hc-accent: #0dcaf0;
+
+    /* Bootstrap 5.3 resolves component text colours through these, and its
+       defaults are the light theme's near-black. */
+    --bs-body-color: #e0e0e0;
+    --bs-body-color-rgb: 224, 224, 224;
+    --bs-body-bg: #121212;
+}
+
+html, body {
+    background-color: var(--hc-bg);
+    color: var(--hc-text);
+}
+
+/* index.html paints itself with Bootstrap's .bg-dark, which is !important and
+   more specific than a bare element selector - redefine it rather than editing
+   every occurrence. */
+.bg-dark {
+    background-color: var(--hc-bg) !important;
+}
+
+/* --- navigation, injected by hamclock.js ---------------------------------- */
+.hc-nav {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: .35rem;
+    padding: .55rem 1rem;
+    margin-bottom: 1rem;
+    background: var(--hc-nav);
+    border-bottom: 2px solid var(--hc-accent);
+}
+
+.hc-nav .hc-brand {
+    font-family: 'Orbitron', sans-serif;
+    color: var(--hc-accent);
+    letter-spacing: .06em;
+    margin-right: 1rem;
+    white-space: nowrap;
+}
+
+.hc-nav a {
+    color: var(--hc-muted);
+    text-decoration: none;
+    padding: .3rem .8rem;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.hc-nav a:hover {
+    color: var(--hc-bright);
+    background: #262626;
+}
+
+.hc-nav a.active {
+    color: #06202a;
+    background: var(--hc-accent);
+    font-weight: 600;
+}
+
+/* --- headings ------------------------------------------------------------- */
+h1 {
+    font-family: 'Orbitron', sans-serif;
+}
+
+.card {
+    background-color: var(--hc-card);
+    border: 1px solid var(--hc-line);
+    /* .card and .card-body both force a colour, so anything inside without an
+       explicit colour class would otherwise be invisible on the dark card. */
+    --bs-card-color: var(--hc-text);
+    color: var(--hc-text);
+}
+
+.card-title {
+    font-family: 'Orbitron', sans-serif;
+    color: #ffffff;
+    font-size: 1.3rem;
+    letter-spacing: .04em;
+    padding-bottom: .5rem;
+    margin-bottom: 1.15rem;
+    border-bottom: 2px solid var(--hc-accent);
+}
+
+/* --- text ----------------------------------------------------------------- */
+.form-label,
+.form-check-label {
+    color: var(--hc-bright);
+    font-size: 1.02rem;
+    font-weight: 500;
+    margin-bottom: .4rem;
+}
+
+.text-secondary,
+.form-text {
+    color: var(--hc-muted) !important;
+}
+
+.form-text {
+    font-size: .875rem;
+}
+
+/* --- form controls -------------------------------------------------------- */
+.form-control,
+.form-select {
+    background-color: #2a2a2a;
+    color: var(--hc-bright);
+    border-color: #5a5a5a;
+}
+
+.form-control:focus,
+.form-select:focus {
+    background-color: #2a2a2a;
+    color: #fff;
+    border-color: var(--hc-accent);
+    box-shadow: none;
+}
+
+.form-control::placeholder {
+    color: #8b96a1;
+}
+
+/* The stock checkbox is nearly invisible against a dark card. */
+.form-check-input {
+    background-color: #2a2a2a;
+    border-color: #6a6a6a;
+}
+
+.form-check-input:checked {
+    background-color: var(--hc-accent);
+    border-color: var(--hc-accent);
+}
+
+.form-check-input:focus {
+    border-color: var(--hc-accent);
+    box-shadow: 0 0 0 .2rem rgba(13, 202, 240, .25);
+}
+
+/* The stock outline-secondary text is so dim on black that the button reads as
+   disabled - keep it visually secondary, but legible. */
+.btn-outline-secondary {
+    --bs-btn-color: #c9d3dd;
+    --bs-btn-border-color: #6c757d;
+    --bs-btn-hover-color: #ffffff;
+    --bs-btn-hover-bg: #6c757d;
+    --bs-btn-hover-border-color: #6c757d;
+}

@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Weather</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="/favicon.ico" rel="icon" type="image/x-icon">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600&display=swap" rel="stylesheet">
+    <link href="/hamclock.css" rel="stylesheet">
+    <script src="/hamclock.js"></script>
+    <style>
+        .reading { font-family: 'Courier New', monospace; }
+        .big { font-size: 2.6rem; font-weight: 600; line-height: 1; }
+        #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+                 z-index: 1080; display: none; }
+    </style>
+</head>
+<body>
+<div class="container py-4">
+
+    <h1 class="text-center mb-1">Weather</h1>
+    <p class="text-center text-secondary">
+        Readings come from <a href="https://open-meteo.com" target="_blank" class="link-secondary">Open-Meteo</a>
+        for the location set on the <a href="/" class="link-info">main settings page</a>.
+        No account or API key is needed.
+    </p>
+
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Current reading <span class="text-secondary small" id="age"></span></h5>
+                    <div id="reading"><p class="text-secondary mb-0">Loading&hellip;</p></div>
+                    <button class="btn btn-outline-secondary btn-sm mt-3" onclick="refreshNow()">↻ Fetch now</button>
+                    <span id="fetchMsg" class="ms-3 text-secondary"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Refresh interval</h5>
+                    <div class="row g-3 align-items-end">
+                        <div class="col-md-6">
+                            <label class="form-label" for="interval">How often to ask Open-Meteo (minutes)</label>
+                            <input type="number" class="form-control" id="interval" min="5" max="120" step="1">
+                            <div class="form-text">
+                                Only today's conditions are requested. Open-Meteo is a free service, so
+                                the shortest allowed interval is 5 minutes.
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <button class="btn btn-info w-100" onclick="save()">💾 Save</button>
+                        </div>
+                        <div class="col-md-3">
+                            <span id="saveMsg"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <p class="text-center text-secondary small">
+        The clock's UTC offset comes with the same reply, so daylight saving follows automatically. Open-Meteo's readings step every 15 minutes.
+    </p>
+</div>
+
+<div id="toast" class="alert alert-info"></div>
+
+<script>
+function toast(msg, kind) {
+    var t = document.getElementById('toast');
+    t.className = 'alert alert-' + (kind || 'info');
+    t.textContent = msg;
+    t.style.display = 'block';
+    clearTimeout(t._h);
+    t._h = setTimeout(function () { t.style.display = 'none'; }, 3000);
+}
+
+function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
+function row(label, value) {
+    return '<div class="col-6 col-md-4 mb-2">' +
+           '<div class="text-secondary small">' + esc(label) + '</div>' +
+           '<div class="reading">' + esc(value) + '</div></div>';
+}
+
+function load() {
+    return fetch('/weathercfg').then(function (r) { return r.json(); }).then(function (c) {
+        document.getElementById('interval').value = c.intervalMin;
+        document.getElementById('interval').min = c.minMin;
+        document.getElementById('interval').max = c.maxMin;
+
+        var box = document.getElementById('reading');
+        if (!c.ok) {
+            box.innerHTML = '<p class="text-warning mb-0">Open-Meteo has not answered yet.</p>';
+            document.getElementById('age').textContent = '';
+            return;
+        }
+
+        var age = Math.max(0, Math.round((c.utc - c.fetchedUnix) / 60));
+        document.getElementById('age').textContent =
+            '(' + (age === 0 ? 'just now' : age + ' min ago') + ')';
+
+        box.innerHTML =
+            '<div class="row align-items-center mb-3">' +
+            '  <div class="col-md-5"><span class="big">' + c.temp.toFixed(1) + '&deg;C</span>' +
+            '    <div class="text-secondary">feels like ' + c.feelsLike.toFixed(1) + '&deg;C</div></div>' +
+            '  <div class="col-md-7"><div class="reading">' + esc(c.city) +
+            (c.country ? ', ' + esc(c.country) : '') + '</div>' +
+            '    <div class="text-secondary">' + esc(c.description) + '</div></div>' +
+            '</div><div class="row">' +
+            row('Today min / max', c.tempMin.toFixed(0) + ' / ' + c.tempMax.toFixed(0) + ' °C') +
+            row('Humidity', c.humidity + ' %') +
+            row('Pressure', c.pressure + ' hPa') +
+            row('Cloud cover', c.clouds + ' %') +
+            row('Wind', c.windSpeed.toFixed(1) + ' m/s ' + (c.windDir || '')) +
+            row('Wind gust', c.windGust.toFixed(1) + ' m/s') +
+            row('Visibility', c.visibilityKm.toFixed(0) + ' km') +
+            row('Precipitation', c.rainMM.toFixed(1) + ' mm') +
+            row('Sunrise', c.sunrise) +
+            row('Sunset', c.sunset) +
+            row('UTC offset', (c.tOffset >= 0 ? '+' : '') + c.tOffset + ' h') +
+            '</div>';
+    }).catch(function () { toast('Could not read the weather from the clock', 'danger'); });
+}
+
+function save() {
+    var mins = parseInt(document.getElementById('interval').value, 10);
+    document.getElementById('saveMsg').innerHTML = '<span class="text-info">Saving…</span>';
+    fetch('/weathercfg', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ intervalMin: mins })
+    }).then(function (r) {
+        if (!r.ok) throw new Error();
+        document.getElementById('saveMsg').innerHTML = '<span class="text-success">Saved.</span>';
+        toast('Refresh interval saved', 'success');
+        load();
+    }).catch(function () {
+        document.getElementById('saveMsg').innerHTML = '<span class="text-danger">Failed.</span>';
+    });
+}
+
+function refreshNow() {
+    var msg = document.getElementById('fetchMsg');
+    msg.textContent = 'Asking Open-Meteo…';
+    fetch('/weathernow').then(function () {
+        // The clock fetches after answering, so give it a moment.
+        setTimeout(function () { msg.textContent = ''; load(); }, 6000);
+    }).catch(function () { msg.textContent = 'Failed'; });
+}
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

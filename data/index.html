@@ -161,6 +161,8 @@
     <link crossorigin href="https://fonts.gstatic.com" rel="preconnect">
     <link href="https://fonts.googleapis.com/css?family=Orbitron&display=swap" rel="stylesheet">
     <link as="font" crossorigin="anonymous" href="/fonts/digital7monoitalic.ttf" rel="preload" type="font/ttf">
+    <link href="/hamclock.css" rel="stylesheet">
+    <script src="/hamclock.js"></script>
 </head>
 <body class="bg-dark">
 
@@ -429,17 +431,6 @@
                 </div>
                 <p class="text-white mt-2" style="font-family: 'Orbitron', sans-serif;">Uploading...</p>
             </div>
-        </div>
-    </div>
-    <div class="row" data-pg-collapsed>
-        <div class="text-center mt-4" data-pg-collapsed><a class="btn btn-warning mt-2" href="/apikey.html"
-                                                           target="_blank">
-            Modify Open Weather API key </a>
-        </div>
-    </div>
-    <div class="row" data-pg-collapsed>
-        <div class="text-center mt-2"><a class="btn btn-info mt-2" href="/sat.html" target="_blank">
-            Satellite pass tracker </a>
         </div>
     </div>
     <div class="row" data-pg-collapsed style="visibility: hidden;">
@@ -1002,20 +993,6 @@
                 console.groupEnd();
 
                 //API-key
-                if (!config.APIkeyIsValid) {
-                    // show toast
-                    const toastEl = document.getElementById('apiKeyToast');
-                    const toast = new bootstrap.Toast(toastEl, {delay: 2500}); // auto-hide after 2.5s
-                    toast.show();
-
-                    // redirect after a short delay
-                    setTimeout(() => {
-                        window.location.href = "/apikey.html";
-                    }, 2500);
-
-                    // 🚨 stop executing the rest of loadConfig
-                    return;
-                }
                 // Auto Page Change
                 if (els.autoPageChange) {
                     els.autoPageChange.checked = !!config.autoPageChange;

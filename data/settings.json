@@ -1,0 +1,21 @@
+{
+  "latitude": 47.2297,
+  "longitude": 16.6186,
+  "localTimeColour": 2016,
+  "utcTimeColour": 63554,
+  "doubleFrame": false,
+  "localFrameColour": 31727,
+  "utcFrameColour": 13120,
+  "bannerColour": 21604,
+  "bannerSpeed": 16,
+  "localTimeLabel": "  QTH Time  ",
+  "utcTimeLabel": "  UTC Time  ",
+  "startupLogo": "logo4.png",
+  "italicClockFonts": false,
+  "autoPageChange": false,
+  "useScreenSaver": true,
+  "bigClockColour": 2016,
+  "screenSaverTimeout": 7200000,
+  "bigClockShowsUtc": false,
+  "weatherIntervalMin": 30
+}

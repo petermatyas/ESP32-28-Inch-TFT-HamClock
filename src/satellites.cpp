@@ -75,6 +75,7 @@ static volatile time_t   g_nowUnix      = 0;
 static volatile bool     g_needPredict  = false;
 static SemaphoreHandle_t g_mutex        = NULL;
 static SemaphoreHandle_t g_predictSignal = NULL;
+static TaskHandle_t      g_predictTask = NULL;
 
 #define SAT_LOCK()   xSemaphoreTake(g_mutex, portMAX_DELAY)
 #define SAT_UNLOCK() xSemaphoreGive(g_mutex)
@@ -1112,6 +1113,60 @@ void satellitesSelfTest()
 
     Serial.printf("🛰️ SGP4 selftest: worst position error %.2e km - %s\n",
                   worst, (worst < 1.0e-4) ? "PASS" : "FAIL");
+
+    // --- moon ---------------------------------------------------------------
+    // Reference figures for one fixed instant at one fixed site, so a mistyped
+    // series coefficient shows up here the way a wrong propagator constant
+    // shows up above.  They come from an independent implementation of the
+    // same theory that was itself checked against published rise/set tables.
+    const double TEST_UNIX = 1787053560.0;          // 2026-08-18 11:46:00 UTC
+    const double TEST_LAT  = 47.2297 * DEG_TO_RAD;
+    const double TEST_LON  = 16.6186 * DEG_TO_RAD;
+    const double TEST_ALT  = 0.150;                 // km
+
+    double jd = sgp4::jdFromUnix(TEST_UNIX);
+
+    sgp4::MoonInfo m;
+    sgp4::moonInfo(jd, TEST_LAT, TEST_LON, TEST_ALT, m);
+
+    // One wrong digit anywhere in the series moves the moon by far more than
+    // these tolerances; they only absorb rounding.
+    bool moonOk = fabs(m.azDeg - 129.7644) < 0.01 &&
+                  fabs(m.elDeg - 7.8163) < 0.01 &&
+                  fabs(m.distanceKm - 394643.56) < 5.0 &&
+                  fabs(m.illuminatedFrac - 0.34473) < 0.001 && m.waxing;
+
+    Serial.printf("MOON selftest: az %.4f el %.4f dist %.1f illum %.5f %s - %s\n",
+                  m.azDeg, m.elDeg, m.distanceKm, m.illuminatedFrac,
+                  m.waxing ? "waxing" : "waning", moonOk ? "PASS" : "FAIL");
+
+    // Rise and set over the same local day, midnight at UTC+2.  dayStart is the
+    // unix instant of local 00:00, so a local time of day just adds on.
+    const long TEST_SHIFT = 2 * 3600;
+    long ln = (long)TEST_UNIX + TEST_SHIFT;
+    double dayStart = (double)(ln - ((ln % 86400L) + 86400L) % 86400L - TEST_SHIFT);
+
+    sgp4::RiseSet rsSun, rsMoon;
+    sgp4::riseSet(sgp4::SKY_SUN,  dayStart, TEST_LAT, TEST_LON, TEST_ALT, rsSun);
+    sgp4::riseSet(sgp4::SKY_MOON, dayStart, TEST_LAT, TEST_LON, TEST_ALT, rsMoon);
+
+    // Expected local 05:53:57, 19:59:55, 12:43:20, 21:59:11.
+    double eSunRise  = dayStart +  5 * 3600 + 53 * 60 + 57;
+    double eSunSet   = dayStart + 19 * 3600 + 59 * 60 + 55;
+    double eMoonRise = dayStart + 12 * 3600 + 43 * 60 + 20;
+    double eMoonSet  = dayStart + 21 * 3600 + 59 * 60 + 11;
+
+    bool rsOk = rsSun.riseValid && rsSun.setValid &&
+                rsMoon.riseValid && rsMoon.setValid &&
+                fabs(rsSun.riseUnix  - eSunRise)  < 30.0 &&
+                fabs(rsSun.setUnix   - eSunSet)   < 30.0 &&
+                fabs(rsMoon.riseUnix - eMoonRise) < 30.0 &&
+                fabs(rsMoon.setUnix  - eMoonSet)  < 30.0;
+
+    Serial.printf("RISE/SET selftest: sun %+.0f/%+.0f s  moon %+.0f/%+.0f s - %s\n",
+                  rsSun.riseUnix - eSunRise, rsSun.setUnix - eSunSet,
+                  rsMoon.riseUnix - eMoonRise, rsMoon.setUnix - eMoonSet,
+                  rsOk ? "PASS" : "FAIL");
 }
 
 void satellitesBegin(double latitude, double longitude)
@@ -1128,9 +1183,23 @@ void satellitesBegin(double latitude, double longitude)
 
     // Low priority on core 0: the pass search is pure arithmetic and must never
     // get in the way of the display or the web server on core 1.
-    xTaskCreatePinnedToCore(satPredictTask, "satpredict", 10240, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(satPredictTask, "satpredict", 10240, NULL, 1, &g_predictTask, 0);
 
     requestPrediction();
+}
+
+// Free stack left in the prediction task; a number creeping towards zero
+// would mean the 10 kB allocation is not enough.
+void satellitesReportHealth()
+{
+    if (!g_predictTask) return;
+    Serial.printf("\U0001F6F0\uFE0F  predict task stack head-room: %u bytes, %u pass(es) held\n",
+                  (unsigned)uxTaskGetStackHighWaterMark(g_predictTask), g_passCount);
+}
+
+double satellitesSiteAltitudeM()
+{
+    return g_altitudeM;
 }
 
 void satellitesSetSite(double latitude, double longitude)

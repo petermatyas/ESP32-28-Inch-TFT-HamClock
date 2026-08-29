@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DX Cluster</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="/favicon.ico" rel="icon" type="image/x-icon">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600&display=swap" rel="stylesheet">
+    <link href="/hamclock.css" rel="stylesheet">
+    <script src="/hamclock.js"></script>
+    <style>
+        .reading { font-family: 'Courier New', monospace; }
+        .chip { min-width: 4.5rem; }
+        #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+                 z-index: 1080; display: none; }
+        table.spots td { font-family: 'Courier New', monospace; }
+    </style>
+</head>
+<body>
+<div class="container py-4">
+
+    <h1 class="text-center mb-1">DX Cluster</h1>
+    <p class="text-center text-secondary">
+        The clock holds a telnet session to a public cluster node and shows the
+        spots it sends. The same filters apply on the display, where they can also
+        be changed with the <strong>FILTER</strong> button.
+    </p>
+
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Connection</h5>
+                    <p class="text-secondary small mb-3">
+                        A cluster login identifies you on a shared amateur network, so it has to be
+                        <strong>your own callsign</strong> &mdash; there is no default and nothing
+                        connects until you enter one. Node operators log every connection.
+                    </p>
+                    <div class="row g-3 align-items-end">
+                        <div class="col-md-3">
+                            <label class="form-label" for="call">Your callsign</label>
+                            <input type="text" class="form-control text-uppercase" id="call"
+                                   maxlength="11" placeholder="e.g. HA5XYZ">
+                        </div>
+                        <div class="col-md-5">
+                            <label class="form-label" for="host">Cluster node</label>
+                            <input type="text" class="form-control" id="host" maxlength="47">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label" for="port">Port</label>
+                            <input type="number" class="form-control" id="port" min="1" max="65535">
+                        </div>
+                        <div class="col-md-2">
+                            <button class="btn btn-info w-100" onclick="save()">&#128190; Save</button>
+                        </div>
+                    </div>
+                    <div class="form-text mt-2">
+                        Known open nodes: <span class="reading">hrd.wa9pie.net:8000</span>,
+                        <span class="reading">dxfun.com:8000</span>,
+                        <span class="reading">dxc.nc7j.com:7373</span>.
+                    </div>
+                    <div class="mt-3">
+                        <span class="text-secondary">Status:</span>
+                        <span class="reading" id="status">&hellip;</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Filter</h5>
+                    <p class="text-secondary small">
+                        Spots are kept whatever the filter says, so turning a band back on
+                        shows what was already collected.
+                    </p>
+
+                    <div class="mb-3">
+                        <div class="text-secondary small mb-2">Bands</div>
+                        <div id="bands" class="d-flex flex-wrap gap-2"></div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="text-secondary small mb-2">Modes</div>
+                        <div id="modes" class="d-flex flex-wrap gap-2"></div>
+                    </div>
+
+                    <button class="btn btn-info" onclick="save()">&#128190; Save filter</button>
+                    <button class="btn btn-outline-secondary ms-2" onclick="setAll(true)">All on</button>
+                    <button class="btn btn-outline-secondary" onclick="setAll(false)">All off</button>
+                    <span id="saveMsg" class="ms-3"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Recent spots <span class="text-secondary small" id="count"></span></h5>
+                    <div id="spots"><p class="text-secondary mb-0">Loading&hellip;</p></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="toast" class="alert alert-info"></div>
+
+<script>
+var BANDS = [], MODES = [], bandMask = 0, modeMask = 0;
+
+function toast(msg, kind) {
+    var t = document.getElementById('toast');
+    t.className = 'alert alert-' + (kind || 'info');
+    t.textContent = msg;
+    t.style.display = 'block';
+    clearTimeout(t._h);
+    t._h = setTimeout(function () { t.style.display = 'none'; }, 3000);
+}
+
+function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
+function paintChips() {
+    var b = document.getElementById('bands');
+    b.innerHTML = '';
+    BANDS.forEach(function (name, i) {
+        var on = (bandMask >> i) & 1;
+        var el = document.createElement('button');
+        el.className = 'btn btn-sm chip ' + (on ? 'btn-success' : 'btn-outline-secondary');
+        el.textContent = name + 'm';
+        el.onclick = function () { bandMask ^= (1 << i); paintChips(); };
+        b.appendChild(el);
+    });
+
+    var m = document.getElementById('modes');
+    m.innerHTML = '';
+    MODES.forEach(function (name, i) {
+        var on = (modeMask >> i) & 1;
+        var el = document.createElement('button');
+        el.className = 'btn btn-sm chip ' + (on ? 'btn-success' : 'btn-outline-secondary');
+        el.textContent = name;
+        el.onclick = function () { modeMask ^= (1 << i); paintChips(); };
+        m.appendChild(el);
+    });
+}
+
+function setAll(on) {
+    bandMask = on ? (1 << BANDS.length) - 1 : 0;
+    modeMask = on ? (1 << MODES.length) - 1 : 0;
+    paintChips();
+}
+
+function loadConfig() {
+    return fetch('/dxcfg').then(function (r) { return r.json(); }).then(function (c) {
+        document.getElementById('call').value = c.call || '';
+        document.getElementById('host').value = c.host || '';
+        document.getElementById('port').value = c.port || 8000;
+        document.getElementById('status').textContent = c.status || '';
+        BANDS = c.bands || [];
+        MODES = c.modes || [];
+        bandMask = c.bandMask | 0;
+        modeMask = c.modeMask | 0;
+        paintChips();
+    }).catch(function () { toast('Could not read the settings from the clock', 'danger'); });
+}
+
+function save() {
+    var call = document.getElementById('call').value.trim().toUpperCase();
+    document.getElementById('saveMsg').innerHTML = '<span class="text-info">Saving…</span>';
+    fetch('/dxcfg', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            call: call,
+            host: document.getElementById('host').value.trim(),
+            port: parseInt(document.getElementById('port').value, 10) || 8000,
+            bandMask: bandMask,
+            modeMask: modeMask
+        })
+    }).then(function (r) {
+        if (!r.ok) throw new Error();
+        document.getElementById('saveMsg').innerHTML = '<span class="text-success">Saved.</span>';
+        toast(call ? 'Saved — reconnecting as ' + call : 'Saved', 'success');
+        setTimeout(loadConfig, 1500);
+    }).catch(function () {
+        document.getElementById('saveMsg').innerHTML = '<span class="text-danger">Failed.</span>';
+    });
+}
+
+function loadSpots() {
+    fetch('/dxspots').then(function (r) { return r.json(); }).then(function (d) {
+        document.getElementById('status').textContent = d.status || '';
+        var box = document.getElementById('spots');
+        var list = d.spots || [];
+        document.getElementById('count').textContent = '(' + list.length + ')';
+
+        if (!list.length) {
+            box.innerHTML = '<p class="text-secondary mb-0">No spots yet.</p>';
+            return;
+        }
+
+        var rows = list.map(function (s) {
+            return '<tr><td>' + esc(s.time) + '</td>' +
+                   '<td class="text-end">' + s.freq.toFixed(1) + '</td>' +
+                   '<td>' + esc(s.band) + 'm</td>' +
+                   '<td class="fw-bold">' + esc(s.call) + '</td>' +
+                   '<td>' + esc(s.mode) + '</td>' +
+                   '<td class="text-secondary">' + esc(s.spotter) + '</td></tr>';
+        }).join('');
+
+        box.innerHTML = '<div class="table-responsive"><table class="table table-sm table-dark spots mb-0">' +
+            '<thead><tr><th>UTC</th><th class="text-end">kHz</th><th>Band</th>' +
+            '<th>DX</th><th>Mode</th><th>Spotter</th></tr></thead><tbody>' + rows +
+            '</tbody></table></div>';
+    }).catch(function () { /* the clock may be busy; try again next tick */ });
+}
+
+loadConfig().then(loadSpots);
+setInterval(loadSpots, 10000);
+</script>
+</body>
+</html>

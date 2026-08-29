@@ -25,6 +25,10 @@ void satellitesBegin(double latitude, double longitude);
 void satellitesRegisterRoutes(WebServer &server);
 
 // Observer position changed in the main settings - re-predict.
+// Site altitude in metres, as configured on the satellite page.  The sun and
+// moon page uses the same figure, so both agree on where the horizon is.
+double satellitesSiteAltitudeM();
+
 void satellitesSetSite(double latitude, double longitude);
 
 // Cheap housekeeping: publishes the current time to the prediction task and
@@ -40,5 +44,8 @@ void satellitesDrawPage(TFT_eSPI &tft, time_t utcNow, int tOffsetHours, bool ful
 // Run the SGP4 propagator against Vallado's published verification vector and
 // print the result to Serial.  Costs a couple of milliseconds at boot.
 void satellitesSelfTest();
+
+// Prints the prediction task's remaining stack, for the health line.
+void satellitesReportHealth();
 
 #endif // HAMCLOCK_SATELLITES_H

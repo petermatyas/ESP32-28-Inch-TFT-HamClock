@@ -83,6 +83,46 @@ void   sunEci(double jd, double rsun[3]);                 // km, same frame as r
 bool   satSunlit(const double rsat[3], const double rsun[3]);
 double sunElevationDeg(double jd, double latRad, double lonRad);
 
+// --- the moon ----------------------------------------------------------------
+// Geocentric equatorial position of the moon in km, in the same frame sunEci()
+// uses.  This is Meeus' low-precision series - the largest periodic terms only.
+// It is worth a few hundredths of a degree, which is far finer than a 320x240
+// panel resolves, and costs a few dozen trig calls rather than a few thousand.
+void moonEci(double jd, double rmoon[3]);
+
+// Topocentric direction of a body whose velocity is not needed.  observe() is
+// the same geometry with a range rate attached.
+void topocentric(const double r[3], double jd, double latRad, double lonRad,
+                 double altKm, double &azDeg, double &elDeg, double &rangeKm);
+
+struct MoonInfo {
+    double azDeg, elDeg;
+    double distanceKm;        // topocentric, so it shrinks as the moon rises
+    double illuminatedFrac;   // 0 = new, 1 = full
+    double phaseAngleDeg;     // 0 = full, 180 = new
+    bool   waxing;
+    double ageDays;           // since the last new moon
+};
+
+void moonInfo(double jd, double latRad, double lonRad, double altKm, MoonInfo &out);
+
+// --- rise and set ------------------------------------------------------------
+enum SkyBody { SKY_SUN = 0, SKY_MOON = 1 };
+
+struct RiseSet {
+    bool   riseValid, setValid;
+    double riseUnix, setUnix;
+    bool   aboveAtStart;      // the body was already up when the window opened
+};
+
+// Rise and set inside the 24 hours from dayStartUnix.  That is the window an
+// almanac reports, so "today's sunset" stays today's even after it has passed,
+// and the answers can be compared with published tables.  Either flag comes
+// back false when the body does not cross in that window - a high-latitude
+// midnight sun, or simply the day the moon skips because its day is 24h50m.
+void riseSet(int body, double dayStartUnix, double latRad, double lonRad,
+             double altKm, RiseSet &out);
+
 // --- pass prediction ---------------------------------------------------------
 struct Pass {
     bool   valid;

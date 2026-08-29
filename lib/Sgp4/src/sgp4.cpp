@@ -494,6 +494,244 @@ double sunElevationDeg(double jd, double latRad, double lonRad)
 }
 
 // -----------------------------------------------------------------------------
+// The moon
+// -----------------------------------------------------------------------------
+namespace {
+
+// Ecliptic longitude, latitude (radians) and distance (km) of the moon.
+// Meeus, Astronomical Algorithms, chapter 47, truncated to the terms above
+// about 0.01 degrees.
+void moonEcliptic(double t, double &lonRad, double &latRad, double &distKm)
+{
+    // Mean arguments, degrees.
+    double Lp = 218.3164477 + 481267.88123421 * t;   // mean longitude
+    double D  = 297.8501921 + 445267.1114034  * t;   // mean elongation
+    double M  = 357.5291092 +  35999.0502909  * t;   // sun's mean anomaly
+    double Mp = 134.9633964 + 477198.8675055  * t;   // moon's mean anomaly
+    double F  =  93.2720950 + 483202.0175233  * t;   // argument of latitude
+
+    D  *= DEG2RAD;
+    M  *= DEG2RAD;
+    Mp *= DEG2RAD;
+    F  *= DEG2RAD;
+
+    double lon = Lp
+        + 6.288774 * sin(Mp)
+        + 1.274027 * sin(2.0 * D - Mp)
+        + 0.658314 * sin(2.0 * D)
+        + 0.213618 * sin(2.0 * Mp)
+        - 0.185116 * sin(M)
+        - 0.114332 * sin(2.0 * F)
+        + 0.058793 * sin(2.0 * D - 2.0 * Mp)
+        + 0.057066 * sin(2.0 * D - M - Mp)
+        + 0.053322 * sin(2.0 * D + Mp)
+        + 0.045758 * sin(2.0 * D - M)
+        - 0.040923 * sin(M - Mp)
+        - 0.034720 * sin(D)
+        - 0.030383 * sin(M + Mp)
+        + 0.015327 * sin(2.0 * D - 2.0 * F)
+        - 0.012528 * sin(Mp + 2.0 * F)
+        + 0.010980 * sin(Mp - 2.0 * F);
+
+    double lat = 5.128122 * sin(F)
+        + 0.280602 * sin(Mp + F)
+        + 0.277693 * sin(Mp - F)
+        + 0.173237 * sin(2.0 * D - F)
+        + 0.055413 * sin(2.0 * D - Mp + F)
+        + 0.046271 * sin(2.0 * D - Mp - F)
+        + 0.032573 * sin(2.0 * D + F)
+        + 0.017198 * sin(2.0 * Mp + F)
+        + 0.009266 * sin(2.0 * D + Mp - F)
+        + 0.008822 * sin(2.0 * Mp - F)
+        + 0.008216 * sin(2.0 * D - M - F)
+        + 0.004324 * sin(2.0 * D - 2.0 * Mp - F)
+        + 0.004200 * sin(2.0 * D + Mp + F);
+
+    distKm = 385000.56
+        - 20905.355 * cos(Mp)
+        -  3699.111 * cos(2.0 * D - Mp)
+        -  2955.968 * cos(2.0 * D)
+        -   569.925 * cos(2.0 * Mp)
+        +    48.888 * cos(M)
+        -     3.149 * cos(2.0 * F)
+        +   246.158 * cos(2.0 * D - 2.0 * Mp)
+        -   152.138 * cos(2.0 * D - M - Mp)
+        -   170.733 * cos(2.0 * D + Mp)
+        -   204.586 * cos(2.0 * D - M)
+        -   129.620 * cos(M - Mp)
+        +   108.743 * cos(D)
+        +   104.755 * cos(M + Mp);
+
+    lonRad = fmod2p(lon * DEG2RAD);
+    latRad = lat * DEG2RAD;
+}
+
+// Apparent ecliptic longitude of the sun, from the same series sunEci() uses.
+double sunEclipticLon(double t)
+{
+    double meanlong = fmod(280.460 + 36000.77 * t, 360.0);
+    double meananom = fmod(357.5277233 + 35999.05034 * t, 360.0) * DEG2RAD;
+    return fmod2p((meanlong + 1.914666471 * sin(meananom)
+                            + 0.019994643 * sin(2.0 * meananom)) * DEG2RAD);
+}
+
+} // namespace
+
+void moonEci(double jd, double rmoon[3])
+{
+    double t = (jd - 2451545.0) / 36525.0;
+
+    double lon, lat, dist;
+    moonEcliptic(t, lon, lat, dist);
+
+    double obliquity = (23.439291 - 0.0130042 * t) * DEG2RAD;
+    double cb = cos(lat), sb = sin(lat);
+    double cl = cos(lon), sl = sin(lon);
+
+    rmoon[0] = dist * cb * cl;
+    rmoon[1] = dist * (cb * sl * cos(obliquity) - sb * sin(obliquity));
+    rmoon[2] = dist * (cb * sl * sin(obliquity) + sb * cos(obliquity));
+}
+
+void topocentric(const double r[3], double jd, double latRad, double lonRad,
+                 double altKm, double &azDeg, double &elDeg, double &rangeKm)
+{
+    double theta = fmod2p(gstime(jd) + lonRad);
+
+    double sinLat = sin(latRad), cosLat = cos(latRad);
+    double sinThe = sin(theta),  cosThe = cos(theta);
+
+    double c  = 1.0 / sqrt(1.0 + FLATTENING * (FLATTENING - 2.0) * sinLat * sinLat);
+    double sq = (1.0 - FLATTENING) * (1.0 - FLATTENING) * c;
+    double achcp = (RE * c + altKm) * cosLat;
+
+    double rx = r[0] - achcp * cosThe;
+    double ry = r[1] - achcp * sinThe;
+    double rz = r[2] - (RE * sq + altKm) * sinLat;
+
+    double topS =  sinLat * cosThe * rx + sinLat * sinThe * ry - cosLat * rz;
+    double topE = -sinThe * rx + cosThe * ry;
+    double topZ =  cosLat * cosThe * rx + cosLat * sinThe * ry + sinLat * rz;
+
+    double range = sqrt(rx * rx + ry * ry + rz * rz);
+
+    double az = atan2(-topE, topS) + PI;
+    if (az >= TWOPI) az -= TWOPI;
+
+    azDeg   = az * RAD2DEG;
+    elDeg   = asin(topZ / range) * RAD2DEG;
+    rangeKm = range;
+}
+
+void moonInfo(double jd, double latRad, double lonRad, double altKm, MoonInfo &out)
+{
+    double t = (jd - 2451545.0) / 36525.0;
+
+    double rmoon[3], rsun[3];
+    moonEci(jd, rmoon);
+    sunEci(jd, rsun);
+
+    topocentric(rmoon, jd, latRad, lonRad, altKm, out.azDeg, out.elDeg, out.distanceKm);
+
+    // The lit fraction follows from the phase angle at the moon, the angle
+    // sun-moon-earth.  Working that out from the two distances and the
+    // elongation, rather than from the elongation alone, is what keeps it
+    // right near new and full.
+    double dm = sqrt(rmoon[0] * rmoon[0] + rmoon[1] * rmoon[1] + rmoon[2] * rmoon[2]);
+    double ds = sqrt(rsun[0] * rsun[0] + rsun[1] * rsun[1] + rsun[2] * rsun[2]);
+    double dot = rmoon[0] * rsun[0] + rmoon[1] * rsun[1] + rmoon[2] * rsun[2];
+
+    double cosPsi = dot / (dm * ds);
+    if (cosPsi >  1.0) cosPsi =  1.0;
+    if (cosPsi < -1.0) cosPsi = -1.0;
+    double psi = acos(cosPsi);                                  // elongation
+
+    double phase = atan2(ds * sin(psi), dm - ds * cos(psi));    // phase angle
+    out.phaseAngleDeg   = phase * RAD2DEG;
+    out.illuminatedFrac = 0.5 * (1.0 + cos(phase));
+
+    // Waxing while the moon leads the sun in ecliptic longitude.  The same
+    // difference gives the age, spread evenly over one synodic month; that
+    // ignores the orbit's eccentricity, so it can be half a day out near the
+    // quarters - which is the precision an age in days is read at anyway.
+    double mlon, mlat, mdist;
+    moonEcliptic(t, mlon, mlat, mdist);
+    double elong = fmod2p(mlon - sunEclipticLon(t));
+
+    out.waxing  = elong < PI;
+    out.ageDays = elong / TWOPI * 29.530588853;
+}
+
+// -----------------------------------------------------------------------------
+// Rise and set
+// -----------------------------------------------------------------------------
+namespace {
+
+double bodyElevation(int body, double unixT, double latRad, double lonRad, double altKm)
+{
+    double jd = jdFromUnix(unixT);
+    double r[3];
+    if (body == SKY_MOON) moonEci(jd, r);
+    else                  sunEci(jd, r);
+
+    double az, el, rng;
+    topocentric(r, jd, latRad, lonRad, altKm, az, el, rng);
+    return el;
+}
+
+} // namespace
+
+void riseSet(int body, double dayStartUnix, double latRad, double lonRad,
+             double altKm, RiseSet &out)
+{
+    // Standard altitudes: the geometric horizon lowered by refraction, and by
+    // the body's own apparent radius.  These are the values almanacs use, which
+    // is why the results agree with published tables to about a minute.  The
+    // moon's parallax needs no term of its own because the position above is
+    // already topocentric.
+    const double h = (body == SKY_MOON) ? -0.583 : -0.833;
+
+    // Ten minutes.  The moon, the faster of the two in elevation, moves well
+    // under half a degree in that time near the horizon, so no crossing hides
+    // between samples outside the polar case where a rise and set nearly meet.
+    const double STEP  = 600.0;
+    const int    STEPS = 144;
+
+    out.riseValid = out.setValid = false;
+    out.riseUnix = out.setUnix = 0.0;
+
+    double prev = bodyElevation(body, dayStartUnix, latRad, lonRad, altKm);
+    out.aboveAtStart = prev >= h;
+
+    for (int i = 1; i <= STEPS; i++)
+    {
+        double t = dayStartUnix + i * STEP;
+        double cur = bodyElevation(body, t, latRad, lonRad, altKm);
+
+        bool rising = cur >= h;
+        if (rising != (prev >= h))
+        {
+            // Bisect to about a second.
+            double lo = t - STEP, hi = t;
+            for (int k = 0; k < 20; k++)
+            {
+                double mid = 0.5 * (lo + hi);
+                if ((bodyElevation(body, mid, latRad, lonRad, altKm) >= h) == rising)
+                    hi = mid;
+                else
+                    lo = mid;
+            }
+            double when = 0.5 * (lo + hi);
+
+            // The first of each kind is the one an almanac lists.
+            if (rising && !out.riseValid) { out.riseValid = true; out.riseUnix = when; }
+            if (!rising && !out.setValid) { out.setValid  = true; out.setUnix  = when; }
+        }
+        prev = cur;
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Pass prediction
 // -----------------------------------------------------------------------------
 namespace {
