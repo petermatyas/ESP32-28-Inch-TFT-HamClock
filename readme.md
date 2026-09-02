@@ -13,15 +13,16 @@ It shows **local and UTC time**, **HF/VHF band conditions**, **solar/geomagnetic
 - ☀️ **Solar & HF propagation** — Data from [hamqsl.com](https://www.hamqsl.com/).  
 - 📡 **Band condition indicators** — Good / Fair / Poor at a glance.  
 - 📶 **Easy Wi-Fi setup** — Captive portal AP **`HB9IIUSetup`** on first boot.  
-- 🌐 **Web interface** — Configure time labels, colors, banner speed, boot logo; upload custom splash.  
+- 🌐 **Web interface** — One page per screen: General (position, callsign, brightness, splash logo, screensaver), Clock, Big Clock, Weather, Satellites, DX Cluster, WiFi.  
 - 🛰️ **Satellite passes** — Track satellites by NORAD id; next passes plus a live "above the horizon now" indicator.
 - ☀️ **Sun & moon** — Positions, rise and set, moon phase and illumination, grey-line indicator. Computed on the device, no network needed.
 - 📻 **NCDXF/IARU beacons** — Which beacon is transmitting on each band right now, with frequencies. Also purely computed.
-- 🌍 **DX cluster** — Live spots from a telnet cluster node, filtered by band and mode from the screen or the web UI.
-- 🕰️ **Three clock faces** — Seven segment, analogue dial, or binary (BCD), switchable from the web UI.
+- 🌍 **DX cluster** — Live spots from a telnet cluster node, filtered by band, mode and continent (Europe) from the screen or the web UI.
+- 🕰️ **Three clock faces** — Seven segment, analogue dial, or binary (BCD), switchable on the Big Clock page.
+- 🔆 **Brightness control** — Backlight dimming from the General page.
 - 💤 **Screensaver mode** — Random pixel animation.  
 - 💾 **Persistent settings** — Stored as JSON in SPIFFS.  
-- 🔗 **OTA + mDNS** — Update over the air; reach it at **`http://hamclock.local`**.  
+- 🔗 **mDNS** — Reach the clock at **`http://hamclock.local`** instead of hunting for its IP.  
 
 ---
 
@@ -34,12 +35,6 @@ It shows **local and UTC time**, **HF/VHF band conditions**, **solar/geomagnetic
 
 ## 🚀 Quick Start
 
-### Option A — Web Installer (no compile)
-Use your browser to flash the latest build:  
-👉 **ESP32 HamClock Web Installer** — https://esp32.hb9iiu.com/  
-(Works with Chrome/Edge and any browser supporting WebSerial.)
-
-### Option B — Manual build
 1. Clone the repo and open with **PlatformIO** (or Arduino IDE).  
 2. Configure **TFT_eSPI** for your panel (ILI9341/ILI9488).  
 3. Build & upload firmware to the ESP32.  
@@ -50,7 +45,7 @@ Use your browser to flash the latest build:
 1. **Power on** the device. It starts an AP called **`HB9IIUSetup`**.  
 2. **Connect** to the AP and open `192.168.4.1` to enter your Wi-Fi credentials.  
 3. After joining your network, access **`http://hamclock.local`**.  
-4. In the web UI, choose colors, labels, banner speed, the big-clock face, and (optionally) **upload a custom splash** image. Weather needs no key.  
+4. In the web UI, set your **position and callsign** on the General page, pick colors and the clock faces on the Clock/Big Clock pages, and (optionally) **upload a custom splash** image. Weather needs no key.  
 5. Done — the clock/propagation panels will update automatically.  
 
 ---
@@ -60,7 +55,7 @@ Use your browser to flash the latest build:
 A dedicated display page (touch through to page 8) lists the next passes over your
 configured location and highlights any satellite that is above the horizon right now.
 
-1. Open **`http://hamclock.local/sat.html`** (also linked from the main settings page).
+1. Open **`http://hamclock.local/sat.html`** (also linked from the navigation bar on every settings page).
 2. Enter the **NORAD catalogue numbers** you want to follow — the ISS is `25544`.
    Up to 8 satellites are supported. Preset buttons cover the common ham and weather birds.
 3. Set the minimum elevation, how many passes to show, and the prediction horizon.
@@ -97,7 +92,7 @@ forward and the left half to go back.
 <td align="center" width="33%"><img src="doc/Screens/07c-bigclock-binary.png" width="300" alt="Page 7 - and as a binary (BCD) clock"><br><sub>Page 7 - and as a binary (BCD) clock</sub></td>
 <td colspan="2" valign="top">
 
-The full-screen clock has three faces, chosen on the <b>Display</b> page of the
+The full-screen clock has three faces, chosen on the <b>Big Clock</b> page of the
 web UI. Whichever is showing, the badge underneath switches the clock between
 <b>QTH</b> and <b>UTC</b> time when tapped.
 
@@ -120,14 +115,14 @@ under each column.
 <tr>
 <td align="center" width="33%"><img src="doc/Screens/05-solar-3.png" width="300" alt="Page 5 - aurora and sporadic-E openings"><br><sub>Page 5 - aurora and sporadic-E openings</sub></td>
 <td align="center" width="33%"><img src="doc/Screens/10-beacons.png" width="300" alt="Page 10 - NCDXF/IARU beacon tracker, computed from the clock alone"><br><sub>Page 10 - NCDXF/IARU beacon tracker, computed from the clock alone</sub></td>
-<td align="center" width="33%"><img src="doc/Screens/12-dx-cluster.png" width="300" alt="Page 12 - live DX cluster spots, filtered by band and mode"><br><sub>Page 12 - live DX cluster spots, filtered by band and mode</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/12-dx-cluster.png" width="300" alt="Page 12 - live DX cluster spots, filtered by band, mode and continent"><br><sub>Page 12 - live DX cluster spots, filtered by band, mode and continent</sub></td>
 </tr>
 </table>
 
 The beacon page needs no network at all: the eighteen NCDXF beacons keep a
 strictly timed three-minute round anchored to 00:00:00 UTC, so accurate time and
 a table are the whole mechanism. The <b>FILTER</b> button on the DX page opens a
-touch panel of band and mode chips.
+touch panel of band, mode and continent chips.
 
 ### Sky, weather and status
 
@@ -155,9 +150,9 @@ it has passed rather than jumping to tomorrow's.
 ## 🔧 Configuration Tips
 - **Display type**: Ensure your **TFT_eSPI** `User_Setup` matches your panel (ILI9341/ILI9488).  
 - **Weather**: Nothing to configure beyond your position — Open-Meteo needs no key. The refresh interval is set on the Weather page.  
-- **DX cluster**: A cluster login identifies you on a shared network, so enter **your own callsign** on the DX Cluster page. Nothing connects until you do.  
+- **DX cluster**: A cluster login identifies you on a shared network, so enter **your own callsign** on the General or DX Cluster page. Nothing connects until you do. The continent filter is best-effort (a callsign-prefix table), not a precise DXCC lookup.  
 - **Band indicators**: Values are derived from hamqsl.com solar/geomagnetic data fetched by the device.  
-- **Splash screen**: Upload a PNG via the web UI; it’s stored in SPIFFS along with your settings.  
+- **Splash screen**: Upload a PNG via the General page; it’s stored in SPIFFS along with your settings.  
 
 ---
 
@@ -166,7 +161,7 @@ This project was inspired by the excellent work of **SQ9ZAQ**:
 - **HamQSL XML Parser** — https://github.com/canislupus11/HamQSL-XML-Parser  
 
 Thanks for the idea and the initial approach to parsing and displaying **hamqsl.com** propagation data on small TFTs.  
-This project is a ground-up implementation for ESP32 with **TFT_eSPI**, a web-configurable UI, captive portal onboarding, and OTA updates.  
+This project is a ground-up implementation for ESP32 with **TFT_eSPI**, a web-configurable UI, and captive portal onboarding.  
 No source code from the above project is copied into this repository. (Attribution provided as inspiration.)  
 
 ---
@@ -180,7 +175,7 @@ No source code from the above project is copied into this repository. (Attributi
 - **I don’t see the portal `HB9IIUSetup`** — Power cycle; ensure the board isn’t already configured to join your Wi-Fi.  
 - **`hamclock.local` doesn’t resolve** — Try the device’s IP from your router; ensure mDNS is supported on your OS/network.  
 - **Blank/garbled display** — Reconfirm your **TFT_eSPI** configuration (pins, controller type).  
-- **Weather not showing** — Check network connectivity and the position set on the main page.  
+- **Weather not showing** — Check network connectivity and the position set on the General page.  
 - **No DX spots** — Check the callsign on the DX Cluster page; the serial log echoes the first lines of each cluster session.  
 
 ---
@@ -195,9 +190,4 @@ This project is licensed under the
 - ✅ You must share any derivative works under the **same license**.  
 - ❌ You may **not use this work for commercial purposes** (e.g., selling preloaded hardware, reselling code, or monetizing it in any way).  
 
-Full license text: [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)  
-
----
-
-## 🌐 Web Installer (direct link)
-👉 **https://esp32.hb9iiu.com/** — flash from your browser with WebSerial.  
+Full license text: [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)    
