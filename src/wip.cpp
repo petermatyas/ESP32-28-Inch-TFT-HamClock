@@ -57,7 +57,7 @@ int tOffset = 0; // will be updated via configuration device time (Iphone) and l
 Preferences prefs;
 // --- globals ---
 uint8_t activePage = 1;
-const uint8_t MAX_PAGES = 12;
+const uint8_t MAX_PAGES = 11;   // page 1 merged the old dual-clock and big-clock pages
 unsigned long lastTouchMs = 0;
 bool wasTouching = false;
 int scanCount = 0;
@@ -74,6 +74,7 @@ enum BigClockStyle : uint8_t
     BIGCLOCK_SEVENSEG = 0,   // the seven segment digits this page started with
     BIGCLOCK_ANALOG   = 1,   // dial, numerals and hands
     BIGCLOCK_BINARY   = 2,   // one column of bits per digit, hours to seconds
+    BIGCLOCK_DUAL     = 3,   // QTH and UTC shown together - the old separate page 1
     BIGCLOCK_STYLE_COUNT
 };
 uint8_t bigClockStyle = BIGCLOCK_SEVENSEG;
@@ -564,7 +565,6 @@ void setup()
             server.serveStatic("/wifi.html", SPIFFS, "/wifi.html");
             server.serveStatic("/weather.html", SPIFFS, "/weather.html");
             server.serveStatic("/clock.html", SPIFFS, "/clock.html");
-            server.serveStatic("/bigclock.html", SPIFFS, "/bigclock.html");
             wifiRegisterRoutes();
             weatherRegisterRoutes();
             server.on("/config", HTTP_GET, []()
@@ -651,7 +651,7 @@ for (int i = 0; i < 4; i++) {
         return;
     }
     saveSettings();
-    if (activePage==1){
+    if (activePage==1 && bigClockStyle == BIGCLOCK_DUAL){
     drawOrredrawStaticElements();
     }
     refreshDigits = true;
@@ -702,9 +702,14 @@ for (int i = 0; i < 4; i++) {
         return;
     }
 
-    // Redraw labels immediately on screen
-    refreshFrames = true;
-    drawOrredrawStaticElements();
+    // Redraw labels immediately on screen, but only if the dual-clock face is
+    // actually the one showing - otherwise this would draw its frame over
+    // whichever of the other three faces is on screen.
+    if (activePage == 1 && bigClockStyle == BIGCLOCK_DUAL)
+    {
+        refreshFrames = true;
+        drawOrredrawStaticElements();
+    }
 
     server.send(200, "text/plain", "OK"); });
 
@@ -733,7 +738,7 @@ for (int i = 0; i < 4; i++) {
     saveSettings();
     // The locator on the QTH frame moves with the position.  Only repaint when
     // that page is the one on screen - the redraw clears the whole display.
-    if (activePage == 1) drawOrredrawStaticElements();
+    if (activePage == 1 && bigClockStyle == BIGCLOCK_DUAL) drawOrredrawStaticElements();
     weather.city[0] = 0;      // re-resolve the place name for the new position
     fetchWeatherData();
     server.send(200, "text/plain", "OK"); });
@@ -771,13 +776,17 @@ for (int i = 0; i < 4; i++) {
 
     // Only repaint when that page is the one on screen; the redraw clears the
     // whole display and would wipe whatever else is showing.
-    if (activePage == 7) {
-        bigClockFullRedraw = true;
+    if (activePage == 1) {
         tft.fillScreen(TFT_BLACK);
-        LASTbigClockTimeStr = "";
-        for (int i = 0; i < 4; i++) bigClockLastDigit[i] = ' ';
-        bigClockColonState = -1;
-        bigClockLabelDirty = true;
+        if (bigClockStyle == BIGCLOCK_DUAL) {
+            drawOrredrawStaticElements();
+        } else {
+            bigClockFullRedraw = true;
+            LASTbigClockTimeStr = "";
+            for (int i = 0; i < 4; i++) bigClockLastDigit[i] = ' ';
+            bigClockColonState = -1;
+            bigClockLabelDirty = true;
+        }
     }
     server.send(200, "text/plain", "OK"); });
 
@@ -793,7 +802,7 @@ for (int i = 0; i < 4; i++) {
     saveSettings();
     Serial.printf("✏️ italicClockFonts set to: %s\n", italicClockFonts ? "true" : "false");
 
-    drawOrredrawStaticElements();
+    if (activePage == 1 && bigClockStyle == BIGCLOCK_DUAL) drawOrredrawStaticElements();
 
     server.send(200, "text/plain", "OK"); });
 
@@ -900,8 +909,7 @@ for (int i = 0; i < 4; i++) {
                           server.send(200, "text/plain", autoPageChange ? "AutoPage ON" : "AutoPage OFF");
                           saveSettings();
 
-                          activePage = 1;
-                          drawOrredrawStaticElements(); // 🖼️ Redraw Big Clock frames
+                          activatePage(1);
                       });
 
             satellitesRegisterRoutes(server);
@@ -1054,10 +1062,8 @@ void loop()
         {
             Serial.println("🖐 Touch detected — exiting screensaver.");
             screenSaver = false;
-            tft.fillScreen(TFT_BLACK);
-            activePage = 1;
             Serial.println("📄 Active page -> 1");
-            drawOrredrawStaticElements(); // 🖼️ Redraw Big Clock frames
+            activatePage(1);
             lastActivity = currentMillis; // 🔄 Reset inactivity timer
         }
         return;
@@ -1067,34 +1073,44 @@ void loop()
         switch (activePage)
         {
         case 1:
-            if (currentMillis - previousMillisForLargeClockUpdate >= 1000) // to not overflow
+            // Page 1 is now all four clock faces - the dual QTH+UTC clock is
+            // just one of the four, picked the same way as the other three.
+            if (bigClockStyle == BIGCLOCK_DUAL)
             {
-                previousMillisForLargeClockUpdate = currentMillis;
-                UTClastTimeStr = "        ";
-                LOCALlastTimeStr = "        ";
+                if (currentMillis - previousMillisForLargeClockUpdate >= 1000) // to not overflow
+                {
+                    previousMillisForLargeClockUpdate = currentMillis;
+                    UTClastTimeStr = "        ";
+                    LOCALlastTimeStr = "        ";
 
-                // 🕒 Update time display
-                ntpTick();
-                long localEpoch = timeClient.getEpochTime() + (tOffset * 3600);
-                String localTime = formatLocalTime(localEpoch);
-                String utcTime = timeClient.getFormattedTime();
+                    // 🕒 Update time display
+                    ntpTick();
+                    long localEpoch = timeClient.getEpochTime() + (tOffset * 3600);
+                    String localTime = formatLocalTime(localEpoch);
+                    String utcTime = timeClient.getFormattedTime();
 
-                tft.setTextColor(TFT_WHITE);
-                tft.setFreeFont(italicClockFonts ? &digital_7_monoitalic42pt7b : &digital_7__mono_42pt7b);
-                displayTime(8, FRAME1_DIGIT_Y, localTime, previousLocalTime, 0, localTimeColour);
-                displayTime(10, FRAME2_DIGIT_Y, utcTime, previousUTCtime, 0, utcTimeColour);
+                    tft.setTextColor(TFT_WHITE);
+                    tft.setFreeFont(italicClockFonts ? &digital_7_monoitalic42pt7b : &digital_7__mono_42pt7b);
+                    displayTime(8, FRAME1_DIGIT_Y, localTime, previousLocalTime, 0, localTimeColour);
+                    displayTime(10, FRAME2_DIGIT_Y, utcTime, previousUTCtime, 0, utcTimeColour);
+                }
+                // 📰 Scroll banner text
+                if (currentMillis - previousMillisForScroller >= bannerSpeed)
+                {
+                    previousMillisForScroller = currentMillis;
+                    scrollingText.fillSprite(TFT_BLACK);
+                    scrollingText.setTextColor(bannerColour);
+                    scrollingText.drawString(scrollText, scrollingTextXposition, 0);
+                    scrollingTextXposition -= 1;
+                    if (scrollingTextXposition < -scrollingText.textWidth(scrollText))
+                        scrollingTextXposition = scrollingText.width();
+                    scrollingText.pushSprite(5, 205);
+                }
             }
-            // 📰 Scroll banner text
-            if (currentMillis - previousMillisForScroller >= bannerSpeed)
+            else
             {
-                previousMillisForScroller = currentMillis;
-                scrollingText.fillSprite(TFT_BLACK);
-                scrollingText.setTextColor(bannerColour);
-                scrollingText.drawString(scrollText, scrollingTextXposition, 0);
-                scrollingTextXposition -= 1;
-                if (scrollingTextXposition < -scrollingText.textWidth(scrollText))
-                    scrollingTextXposition = scrollingText.width();
-                scrollingText.pushSprite(5, 205);
+                currentMillis = millis();
+                drawBigClockPage();
             }
             break;
 
@@ -1169,20 +1185,13 @@ void loop()
             break;
         case 7:
         {
-            currentMillis = millis();
-            drawBigClockPage();
-            break;
-        }
-
-        case 8:
-        {
             satellitesDrawPage(tft, (time_t)timeClient.getEpochTime(), tOffset,
                                redrawSatellitePage);
             redrawSatellitePage = false;
             break;
         }
 
-        case 9:
+        case 8:
         {
             if (redrawWeatherPage)
             {
@@ -1197,7 +1206,7 @@ void loop()
             break;
         }
 
-        case 10:
+        case 9:
         {
             // Cheap: the renderer decides for itself what actually changed.
             drawBeaconPage(redrawBeaconPage);
@@ -1205,14 +1214,14 @@ void loop()
             break;
         }
 
-        case 11:
+        case 10:
         {
             drawSunMoonPage(redrawSunMoonPage);
             redrawSunMoonPage = false;
             break;
         }
 
-        case 12:
+        case 11:
         {
             dxClusterDrawPage(tft, (time_t)timeClient.getEpochTime(), redrawDxPage);
             redrawDxPage = false;
@@ -1234,8 +1243,7 @@ void loop()
             }
             if (activePage == 2)
             {
-                activePage = 1;
-                drawOrredrawStaticElements(); // 🖼️ Redraw Big Clock frames
+                activatePage(1);
             }
         }
     }
@@ -1979,7 +1987,26 @@ static void activatePage(uint8_t page)
     switch (activePage)
     {
     case 1:
-        drawOrredrawStaticElements(); // 🖼️ Redraw Big Clock frames
+        // Page 1 is all four clock faces now; only the dual QTH+UTC face uses
+        // drawOrredrawStaticElements() - the other three share the big-clock
+        // reset sequence the old page 7 used on entry.
+        if (bigClockStyle == BIGCLOCK_DUAL)
+        {
+            drawOrredrawStaticElements();
+        }
+        else
+        {
+            LASTbigClockTimeStr = "";
+            for (int i = 0; i < 4; i++)
+            {
+                bigClockLastDigit[i] = ' ';
+            }
+            // Unknown state, so the first pass through the loop paints the colon
+            // immediately after the screen clear.
+            bigClockColonState = -1;
+            bigClockLabelDirty = true;
+            bigClockFullRedraw = true;
+        }
         break;
     case 2:
         redrawMainPropagationPage = true;
@@ -1997,30 +2024,18 @@ static void activatePage(uint8_t page)
         reDrawWiFiQualityPage = true;
         break;
     case 7:
-        LASTbigClockTimeStr = "";
-        for (int i = 0; i < 4; i++)
-        {
-            bigClockLastDigit[i] = ' ';
-        }
-        // Unknown state, so the first pass through the loop paints the colon
-        // immediately after the screen clear.
-        bigClockColonState = -1;
-        bigClockLabelDirty = true;
-        bigClockFullRedraw = true;
-        break;
-    case 8:
         redrawSatellitePage = true;
         break;
-    case 9:
+    case 8:
         redrawWeatherPage = true;
         break;
-    case 10:
+    case 9:
         redrawBeaconPage = true;
         break;
-    case 11:
+    case 10:
         redrawSunMoonPage = true;
         break;
-    case 12:
+    case 11:
         redrawDxPage = true;
         break;
     }
@@ -2039,10 +2054,12 @@ void handleTouchToRotatePage()
             wasTouching = true;
             lastTouchMs = now;
 
-            // On the big clock page the badge is a button: tapping it switches
-            // the time base rather than paging.  Checked first so the paging
-            // halves cannot swallow the tap.
-            if (activePage == 7 &&
+            // On the three single-time clock faces the badge is a button:
+            // tapping it switches the time base rather than paging.  Checked
+            // first so the paging halves cannot swallow the tap.  The dual
+            // face has no badge - it already shows both times, and that
+            // screen region is its weather banner instead.
+            if (activePage == 1 && bigClockStyle != BIGCLOCK_DUAL &&
                 x >= BIGCLOCK_BADGE_X - 10 && x <= BIGCLOCK_BADGE_X + BIGCLOCK_BADGE_W + 10 &&
                 y >= BIGCLOCK_BADGE_Y - 10 && y <= BIGCLOCK_BADGE_Y + BIGCLOCK_BADGE_H + 10)
             {
@@ -2067,7 +2084,7 @@ void handleTouchToRotatePage()
             // The DX page has a button of its own, and while its filter panel
             // is up it owns every tap - otherwise a miss would page out from
             // under the panel.
-            if (activePage == 12 && dxClusterHandleTouch((int16_t)x, (int16_t)y))
+            if (activePage == 11 && dxClusterHandleTouch((int16_t)x, (int16_t)y))
             {
                 redrawDxPage = true;
                 return;
@@ -2850,7 +2867,8 @@ static void maidenhead(double latDeg, double lonDeg, char *out, size_t n)
 }
 
 // =============================================================================
-// Big clock (page 7), in three styles
+// Big clock: three of page 1's four faces (the fourth, BIGCLOCK_DUAL, is the
+// QTH+UTC display drawn separately via drawOrredrawStaticElements())
 //
 // All three share the QTH/UTC badge at the foot of the screen and the touch
 // target that goes with it, so only the area above y=200 differs between them.

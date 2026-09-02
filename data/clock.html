@@ -23,7 +23,16 @@
             font-size: 48px;
             color: #fff;
         }
-        #colorPicker { margin: 0 auto; }
+        .time-preview-big {
+            border: 6px solid #444;
+            border-radius: 16px;
+            padding: 10px 30px;
+            display: inline-block;
+            font-family: 'Digital7', monospace;
+            font-size: 64px;
+            color: #78d83c;
+        }
+        #colorPicker, #bigColorPicker { margin: 0 auto; }
         #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
                  z-index: 1080; display: none; }
 
@@ -39,11 +48,33 @@
 
     <h1 class="text-center mb-1">Clock</h1>
     <p class="text-center text-secondary">
-        Colours and layout for page 1, the dual QTH/UTC clock. GPS position and
-        other page-independent settings live on the <a href="/" class="link-info">General page</a>.
+        Page 1's four faces: dual QTH/UTC, seven-segment, analogue and binary.
+        GPS position and other page-independent settings live on the
+        <a href="/" class="link-info">General page</a>.
     </p>
 
     <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Face</h5>
+                    <label class="form-label" for="styleSelect">Style</label>
+                    <select class="form-select" id="styleSelect" style="max-width: 340px;">
+                        <option value="3">Dual QTH + UTC</option>
+                        <option value="0">Seven segment digits</option>
+                        <option value="1">Analogue dial with hands</option>
+                        <option value="2">Binary (BCD) clock</option>
+                    </select>
+                    <div class="form-text" id="badgeHint">
+                        Tapping the badge under this face on the device switches it between QTH and UTC time.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dual-face preview -->
+    <div class="row" id="dualPreviewRow">
         <div class="col-lg-10 offset-lg-1">
             <div class="card mb-4">
                 <div class="card-body text-center">
@@ -63,7 +94,32 @@
         </div>
     </div>
 
-    <div class="row">
+    <!-- Single-face preview (seven-segment / analogue / binary) -->
+    <div class="row" id="bigPreviewRow">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body text-center">
+                    <h5 class="card-title text-start">Live preview</h5>
+                    <div class="time-preview-big" id="bigClockTime">00:00</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Single-face colour -->
+    <div class="row" id="bigColorRow">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body text-center">
+                    <h5 class="card-title text-start">Colour</h5>
+                    <div id="bigColorPicker"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dual-face colours -->
+    <div class="row" id="dualColorRow">
         <div class="col-lg-10 offset-lg-1">
             <div class="card mb-4">
                 <div class="card-body">
@@ -105,7 +161,7 @@
         </div>
     </div>
 
-    <div class="row">
+    <div class="row" id="frameFontRow">
         <div class="col-lg-10 offset-lg-1">
             <div class="card mb-4">
                 <div class="card-body">
@@ -123,13 +179,13 @@
         </div>
     </div>
 
-    <div class="row">
+    <div class="row" id="bannerRow">
         <div class="col-lg-10 offset-lg-1">
             <div class="card mb-4">
                 <div class="card-body">
                     <h5 class="card-title">Weather info banner</h5>
                     <p class="text-secondary small">
-                        The scrolling line under the clocks, shown while page 1 is on screen.
+                        The scrolling line under the clocks, shown while this face is on screen.
                     </p>
                     <div class="text-center mb-3" style="overflow:hidden; white-space:nowrap;">
                         <span id="bannerPreview" style="font-family:'Orbitron',sans-serif;">
@@ -175,6 +231,38 @@ function rgb565FromHex(hex) {
     return (Math.round(r * 31 / 255) & 0x1F) << 11 | (Math.round(g * 63 / 255) & 0x3F) << 5 | (Math.round(b * 31 / 255) & 0x1F);
 }
 
+// --- face selector: show the dual-clock controls or the single-face ones ---
+var DUAL = 3;
+
+function isDual() {
+    return parseInt(document.getElementById('styleSelect').value, 10) === DUAL;
+}
+
+function applyStyleVisibility() {
+    var dual = isDual();
+    document.getElementById('dualPreviewRow').hidden = !dual;
+    document.getElementById('dualColorRow').hidden = !dual;
+    document.getElementById('frameFontRow').hidden = !dual;
+    document.getElementById('bannerRow').hidden = !dual;
+    document.getElementById('bigPreviewRow').hidden = dual;
+    document.getElementById('bigColorRow').hidden = dual;
+    document.getElementById('badgeHint').hidden = dual;
+}
+
+document.getElementById('styleSelect').addEventListener('change', function () {
+    applyStyleVisibility();
+    var style = parseInt(this.value, 10);
+    fetch('/setbigclockstyle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bigClockStyle: style })
+    }).then(function (r) {
+        if (!r.ok) throw new Error();
+        toast('Face saved', 'success');
+    }).catch(function () { toast('Could not save the face', 'danger'); });
+});
+
+// --- dual-clock colour picker (4 targets) ---------------------------------
 var currentTarget = 'localTimeDigits';
 function setColorTarget(target) {
     currentTarget = target;
@@ -207,6 +295,25 @@ colorPicker.on('input:end', function (color) {
     }).catch(function () { toast('Could not save that colour', 'danger'); });
 });
 
+// --- single-face colour picker (one target) -------------------------------
+var bigColorPicker = new iro.ColorPicker('#bigColorPicker', { width: 200, color: '#78d83c' });
+
+bigColorPicker.on('color:change', function (color) {
+    document.getElementById('bigClockTime').style.color = color.hexString;
+});
+
+bigColorPicker.on('input:end', function (color) {
+    fetch('/setcolor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: 'bigClockTime', color: rgb565FromHex(color.hexString) })
+    }).then(function (r) {
+        if (!r.ok) throw new Error();
+        toast('Colour saved', 'success');
+    }).catch(function () { toast('Could not save that colour', 'danger'); });
+});
+
+// --- live previews ----------------------------------------------------------
 function formatTime(date, utc) {
     var h = utc ? date.getUTCHours() : date.getHours();
     var m = utc ? date.getUTCMinutes() : date.getMinutes();
@@ -217,10 +324,13 @@ function tick() {
     var now = new Date();
     document.getElementById('localTime').textContent = formatTime(now, false);
     document.getElementById('utcTime').textContent = formatTime(now, true);
+    document.getElementById('bigClockTime').textContent =
+        String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
 }
 setInterval(tick, 1000);
 tick();
 
+// --- dual-only controls ----------------------------------------------------
 document.getElementById('thinBorder').addEventListener('change', function () {
     var thin = this.checked;
     document.getElementById('localTime').style.borderWidth = thin ? '3px' : '6px';
@@ -264,13 +374,18 @@ document.getElementById('speedSlider').addEventListener('change', function () {
     }).catch(function () { toast('Could not save the scroll speed', 'danger'); });
 });
 
+// --- load current settings -------------------------------------------------
 function loadConfig() {
     fetch('/config').then(function (r) { return r.json(); }).then(function (c) {
+        document.getElementById('styleSelect').value = String(c.bigClockStyle ?? DUAL);
+        applyStyleVisibility();
+
         document.getElementById('localTime').style.color = hexFrom565(c.localTimeColour || 0);
         document.getElementById('localTime').style.borderColor = hexFrom565(c.localFrameColour || 0);
         document.getElementById('utcTime').style.color = hexFrom565(c.utcTimeColour || 0);
         document.getElementById('utcTime').style.borderColor = hexFrom565(c.utcFrameColour || 0);
         document.getElementById('bannerPreview').style.color = hexFrom565(c.bannerColour || 0);
+        document.getElementById('bigClockTime').style.color = hexFrom565(c.bigClockColour ?? 0);
 
         document.getElementById('thinBorder').checked = !c.doubleFrame;
         var borderWidth = c.doubleFrame ? '6px' : '3px';

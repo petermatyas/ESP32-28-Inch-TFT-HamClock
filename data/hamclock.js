@@ -6,7 +6,6 @@
     var PAGES = [
         { href: '/',             label: 'General' },
         { href: '/clock.html',   label: 'Clock' },
-        { href: '/bigclock.html', label: 'Big Clock' },
         { href: '/weather.html', label: 'Weather' },
         { href: '/sat.html',    label: 'Satellites' },
         { href: '/dx.html',     label: 'DX Cluster' },

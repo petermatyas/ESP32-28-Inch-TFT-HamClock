@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// satellites.cpp - satellite pass page (TFT page 8) and its web configurator
+// satellites.cpp - satellite pass page (TFT page 7) and its web configurator
 //
 // Layout of this file:
 //   1. configuration + state          5. web routes
