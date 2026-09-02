@@ -7,15 +7,17 @@
   "localFrameColour": 31727,
   "utcFrameColour": 13120,
   "bannerColour": 21604,
-  "bannerSpeed": 16,
+  "bannerSpeed": 11,
   "localTimeLabel": "  QTH Time  ",
   "utcTimeLabel": "  UTC Time  ",
   "startupLogo": "logo4.png",
   "italicClockFonts": false,
   "autoPageChange": false,
   "useScreenSaver": true,
-  "bigClockColour": 2016,
-  "screenSaverTimeout": 7200000,
-  "bigClockShowsUtc": false,
-  "weatherIntervalMin": 30
+  "bigClockColour": 11877,
+  "screenSaverTimeout": 120000,
+  "bigClockShowsUtc": true,
+  "bigClockStyle": 0,
+  "weatherIntervalMin": 30,
+  "brightness": 100
 }

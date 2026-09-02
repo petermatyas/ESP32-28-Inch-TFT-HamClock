@@ -66,6 +66,18 @@ bool autoPageChange = false;
 char bigClockLastDigit[4] = {' ', ' ', ' ', ' '};
 int8_t bigClockColonState = -1;   // big clock colon: -1 unknown, 0 hidden, 1 shown
 bool bigClockShowsUtc = false;    // big clock time base: false = QTH, true = UTC
+
+// How the big clock draws the time.  Chosen on the web page; the QTH/UTC badge
+// underneath works the same way whichever is picked.
+enum BigClockStyle : uint8_t
+{
+    BIGCLOCK_SEVENSEG = 0,   // the seven segment digits this page started with
+    BIGCLOCK_ANALOG   = 1,   // dial, numerals and hands
+    BIGCLOCK_BINARY   = 2,   // one column of bits per digit, hours to seconds
+    BIGCLOCK_STYLE_COUNT
+};
+uint8_t bigClockStyle = BIGCLOCK_SEVENSEG;
+bool bigClockFullRedraw = true;   // the style changed, or the page just opened
 bool bigClockLabelDirty = true;
 
 // The QTH/UTC label, sat at the bottom of the screen.  The digits end at
@@ -140,6 +152,15 @@ uint16_t localFrameColour = TFT_DARKGREY;
 uint16_t utcFrameColour = TFT_DARKGREY;
 uint16_t bannerColour = TFT_DARKGREEN;
 uint16_t bigClockColour = TFT_GREEN;
+int brightness = 100;   // backlight, percent - see applyBrightness()
+static const int BACKLIGHT_LEDC_CHANNEL = 0;
+
+// Page 1 (dual clock) frame geometry.  No page header here - the page is
+// nothing but the two clocks, so the full screen height goes to them instead.
+static const int FRAME_TOP1 = 0, FRAME_H = 87;                   // 0..87
+static const int FRAME_TOP2 = FRAME_TOP1 + FRAME_H + 18;         // 105..192
+const int FRAME1_DIGIT_Y = FRAME_TOP1 + 5;
+const int FRAME2_DIGIT_Y = FRAME_TOP2 + 2;
 
 int bannerSpeed = 5;
 String localTimeLabel = "  QTH Time  ";
@@ -309,6 +330,7 @@ String convertEpochToTimeString(long epochTime);
 void displayTime(int x, int y, String time, String &previousTime, int yOffset, uint16_t fontColor);
 String convertTimestampToDate(long timestamp);
 void loadSettings();
+void applyBrightness();
 void handleRoot();
 void handleSave();
 void drawOrredrawStaticElements();
@@ -321,6 +343,12 @@ void drawSolarSummaryPage2();
 void drawSolarSummaryPage3();
 void drawWiFiQualityPage();
 void drawBigClockModeBadge();
+void drawBigClockPage();
+static void drawPageHeader(const char *title);
+static void drawHeaderCornerClock(bool utc);
+static void drawPageHeaderWithClock(const char *title, bool utc);
+static void activatePage(uint8_t page);
+static void handleScreenshot();
 static void maidenhead(double latDeg, double lonDeg, char *out, size_t n);
 bool ntpTick();
 void drawNtpStatus();
@@ -465,9 +493,10 @@ void setup()
     std::set_new_handler(reportAllocationFailure);
     Serial.printf("\U0001FA7A Last reset reason: %s\n", resetReasonName());
 
-    // Backlight pin setup
-    pinMode(TFT_BLP, OUTPUT);
-    digitalWrite(TFT_BLP, HIGH); // Turn backlight ON permanently
+    // Backlight PWM: channel set up now, duty applied once the saved
+    // brightness is known (after loadSettings(), below).
+    ledcSetup(BACKLIGHT_LEDC_CHANNEL, 5000, 8);
+    ledcAttachPin(TFT_BLP, BACKLIGHT_LEDC_CHANNEL);
 
     //   Initialize TFT display
     tft.init();
@@ -483,6 +512,7 @@ void setup()
     mountAndListSPIFFS();
     // Load saved settings first
     loadSettings();
+    applyBrightness();
     // Display PNG from SPIFFS
     displayPNGfromSPIFFS(startupLogo.c_str(), 0);
     // BETA release display
@@ -533,6 +563,8 @@ void setup()
             server.serveStatic("/hamclock.js", SPIFFS, "/hamclock.js");
             server.serveStatic("/wifi.html", SPIFFS, "/wifi.html");
             server.serveStatic("/weather.html", SPIFFS, "/weather.html");
+            server.serveStatic("/clock.html", SPIFFS, "/clock.html");
+            server.serveStatic("/bigclock.html", SPIFFS, "/bigclock.html");
             wifiRegisterRoutes();
             weatherRegisterRoutes();
             server.on("/config", HTTP_GET, []()
@@ -555,6 +587,9 @@ void setup()
 doc["screenSaverTimeout"] = screenSaverTimeout / 60000;  // convert ms → minutes
 doc ["autoPageChange"] =autoPageChange;
 doc ["bigClockShowsUtc"] = bigClockShowsUtc;
+doc ["bigClockStyle"] = bigClockStyle;
+doc ["bigClockColour"] = bigClockColour;
+doc ["brightness"] = brightness;
 
   String response;
   serializeJson(doc, response);
@@ -703,6 +738,49 @@ for (int i = 0; i < 4; i++) {
     fetchWeatherData();
     server.send(200, "text/plain", "OK"); });
 
+            // Jump the display to a page, so the web side can drive it - and so
+            // the screenshots below can be taken of every page in turn.
+            server.on("/setpage", HTTP_GET, []()
+                      {
+    int p = server.hasArg("p") ? server.arg("p").toInt() : 0;
+    if (p < 1 || p > MAX_PAGES) {
+        server.send(400, "text/plain", "page out of range");
+        return;
+    }
+    activatePage((uint8_t)p);
+    Serial.printf("Page set to %d from the web\n", p);
+    server.send(200, "text/plain", "OK"); });
+
+            server.on("/screenshot", HTTP_GET, []() { handleScreenshot(); });
+
+            server.on("/setbigclockstyle", HTTP_POST, []()
+                      {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "text/plain", "JSON parse error");
+        return;
+    }
+    int style = doc["bigClockStyle"] | (int)bigClockStyle;
+    if (style < 0 || style >= BIGCLOCK_STYLE_COUNT) {
+        server.send(400, "text/plain", "unknown style");
+        return;
+    }
+    bigClockStyle = (uint8_t)style;
+    saveSettings();
+    Serial.printf("Big clock style -> %u\n", bigClockStyle);
+
+    // Only repaint when that page is the one on screen; the redraw clears the
+    // whole display and would wipe whatever else is showing.
+    if (activePage == 7) {
+        bigClockFullRedraw = true;
+        tft.fillScreen(TFT_BLACK);
+        LASTbigClockTimeStr = "";
+        for (int i = 0; i < 4; i++) bigClockLastDigit[i] = ' ';
+        bigClockColonState = -1;
+        bigClockLabelDirty = true;
+    }
+    server.send(200, "text/plain", "OK"); });
+
             server.on("/setitalic", HTTP_POST, []()
                       {
     JsonDocument doc;
@@ -718,53 +796,6 @@ for (int i = 0; i < 4; i++) {
     drawOrredrawStaticElements();
 
     server.send(200, "text/plain", "OK"); });
-
-            server.on("/saveall", HTTP_POST, []()
-                      {
-    if (!server.hasArg("plain")) {
-        server.send(400, "text/plain", "❌ Missing JSON body");
-        Serial.println("❌ No JSON payload received!");
-        return;
-    }
-
-    String json = server.arg("plain");
-    Serial.println("\n📨 Received JSON from webpage:");
-    Serial.println(json);
-
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, json);
-
-    // 🔧 Apply settings directly to global variables (not config struct!)
-    latitude             = doc["latitude"] | latitude;
-    longitude            = doc["longitude"] | longitude;
-    localTimeLabel       = doc["localTimeLabel"] | localTimeLabel;
-    utcTimeLabel         = doc["utcTimeLabel"] | utcTimeLabel;
-    italicClockFonts     = doc["italicClockFonts"] | italicClockFonts;
-    doubleFrame          = doc["doubleFrame"] | doubleFrame;
-    bannerSpeed          = doc["bannerSpeed"] | bannerSpeed;
-    screenSaverTimeout   = doc["screenSaverTimeout"] | screenSaverTimeout;
-
-    // 📋 Debug printout of applied values
-    Serial.println("📋 Parsed and applied config:");
-    Serial.println("──────────────────────────────────────────────");
-    Serial.printf("📍 Latitude             : %.6f\n", latitude);
-    Serial.printf("📍 Longitude            : %.6f\n", longitude);
-    Serial.printf("🕒 Local Time Label     : %s\n", localTimeLabel.c_str());
-    Serial.printf("🕒 UTC Time Label       : %s\n", utcTimeLabel.c_str());
-    Serial.printf("✍️  Italic Fonts         : %s\n", italicClockFonts ? "true" : "false");
-    Serial.printf("🖼️  Double Frame         : %s\n", doubleFrame ? "true" : "false");
-    Serial.printf("🏃 Banner Speed         : %d\n", bannerSpeed);
-    Serial.printf("💤 ScreenSaver Timeout  : %lu ms (%.2f min)\n",
-                  screenSaverTimeout,
-                  screenSaverTimeout / 60000.0);
-    Serial.println("──────────────────────────────────────────────");
-
-    // 💾 Save settings to SPIFFS (your version will do the actual work)
-    saveSettings();
-    Serial.println("✅ Settings saved to flash.");
-
-    server.send(200, "text/plain", "💾 Settings saved to flash");
-    esp_restart(); });
 
             server.on("/setbootimage", HTTP_POST, []()
                       {
@@ -847,7 +878,18 @@ for (int i = 0; i < 4; i++) {
   }
   server.send(400, "application/json", "{\"status\":\"bad request\"}"); });
 
-
+            server.on("/setbrightness", HTTP_POST, []()
+                      {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "text/plain", "JSON parse error");
+        return;
+    }
+    brightness = constrain((int)(doc["brightness"] | brightness), 10, 100);
+    applyBrightness();
+    saveSettings();
+    Serial.printf("\U0001F4A1 Brightness set to %d%%\n", brightness);
+    server.send(200, "text/plain", "OK"); });
 
             server.on("/setAutoPage", HTTP_GET, []()
                       {
@@ -1039,8 +1081,8 @@ void loop()
 
                 tft.setTextColor(TFT_WHITE);
                 tft.setFreeFont(italicClockFonts ? &digital_7_monoitalic42pt7b : &digital_7__mono_42pt7b);
-                displayTime(8, 5, localTime, previousLocalTime, 0, localTimeColour);
-                displayTime(10, 107, utcTime, previousUTCtime, 0, utcTimeColour);
+                displayTime(8, FRAME1_DIGIT_Y, localTime, previousLocalTime, 0, localTimeColour);
+                displayTime(10, FRAME2_DIGIT_Y, utcTime, previousUTCtime, 0, utcTimeColour);
             }
             // 📰 Scroll banner text
             if (currentMillis - previousMillisForScroller >= bannerSpeed)
@@ -1128,71 +1170,7 @@ void loop()
         case 7:
         {
             currentMillis = millis();
-            tft.setFreeFont(&digits60pt7b);
-
-            // One second on, one second off.  Driven by the parity of the clock's
-            // own seconds rather than a millis() timer, so the blink stays in
-            // step with the time on screen instead of drifting against it.
-            {
-                int8_t wantColon = (timeClient.getEpochTime() % 2 == 0) ? 1 : 0;
-                if (wantColon != bigClockColonState)
-                {
-                    bigClockColonState = wantColon;
-                    tft.setFreeFont(&digits60pt7b);
-                    tft.setTextColor(wantColon ? bigClockColour : TFT_BLACK);
-                    tft.drawString(":", 151, 65, 1);
-                }
-            }
-            if (bigClockLabelDirty)
-            {
-                drawBigClockModeBadge();
-                bigClockLabelDirty = false;
-            }
-
-            long shownEpoch = timeClient.getEpochTime() +
-                              (bigClockShowsUtc ? 0L : (long)tOffset * 3600L);
-
-            struct tm *ptm = gmtime((time_t *)&shownEpoch);
-
-            String localTime = String(ptm->tm_hour < 10 ? "0" : "") + String(ptm->tm_hour) + ":" +
-                               String(ptm->tm_min < 10 ? "0" : "") + String(ptm->tm_min);
-
-            // Positions for HH:MM digits
-            const int digitX[4] = {5, 78, 180, 253}; // x positions for H1, H2, M1, M2
-            const int digitY = 65;                   // same Y for all digits
-
-            if (localTime != LASTbigClockTimeStr)
-            {
-                // Set the font at the point of use: the badge above draws with
-                // its own font and anything else added here would too.
-                tft.setFreeFont(&digits60pt7b);
-
-                // Break current time "HH:MM" into 4 chars
-                char currentDigits[4];
-                currentDigits[0] = localTime.charAt(0); // H tens
-                currentDigits[1] = localTime.charAt(1); // H ones
-                currentDigits[2] = localTime.charAt(3); // M tens
-                currentDigits[3] = localTime.charAt(4); // M ones
-
-                // Compare digit by digit
-                for (int i = 0; i < 4; i++)
-                {
-                    if (currentDigits[i] != bigClockLastDigit[i])
-                    {
-                        // Erase old digit
-                        tft.setTextColor(TFT_BLACK);
-                        tft.drawString(String(bigClockLastDigit[i]), digitX[i], digitY, 1);
-
-                        // Draw new digit
-                        tft.setTextColor(bigClockColour);
-                        tft.drawString(String(currentDigits[i]), digitX[i], digitY, 1);
-
-                        // Update bigClockLastDigit
-                        bigClockLastDigit[i] = currentDigits[i];
-                    }
-                }
-                LASTbigClockTimeStr = localTime;
-            }
+            drawBigClockPage();
             break;
         }
 
@@ -1640,9 +1618,13 @@ void loadSettings()
     useScreenSaver = doc["useScreenSaver"] | useScreenSaver;
     bigClockColour = doc["bigClockColour"] | bigClockColour;
     bigClockShowsUtc = doc["bigClockShowsUtc"] | bigClockShowsUtc;
+    bigClockStyle = doc["bigClockStyle"] | bigClockStyle;
+    if (bigClockStyle >= BIGCLOCK_STYLE_COUNT) bigClockStyle = BIGCLOCK_SEVENSEG;
     weatherIntervalMin = doc["weatherIntervalMin"] | weatherIntervalMin;
     if (weatherIntervalMin < WEATHER_INTERVAL_MIN_LIMIT) weatherIntervalMin = WEATHER_INTERVAL_MIN_LIMIT;
     if (weatherIntervalMin > WEATHER_INTERVAL_MAX_LIMIT) weatherIntervalMin = WEATHER_INTERVAL_MAX_LIMIT;
+    brightness = doc["brightness"] | brightness;
+    brightness = constrain(brightness, 10, 100);
 
     Serial.println();
     Serial.println("-----------------------------------------------------------------");
@@ -1666,7 +1648,21 @@ void loadSettings()
     Serial.printf("🕓 screenSaverTimeout: %lu ms\n", screenSaverTimeout);
     Serial.printf("⚡ Auto Page Change    : %s\n", autoPageChange ? "true" : "false");
     Serial.printf("⚡ Use Screen Saver    : %s\n", useScreenSaver ? "true" : "false");
+    Serial.printf("💡 Brightness          : %d%%\n", brightness);
     Serial.println("-----------------------------------------------------------------");
+}
+
+// Duty scaled for the backlight's own polarity: TFT_BACKLIGHT_ON is defined
+// HIGH for the cyd board (higher duty = brighter) and left undefined for the
+// generic board, whose backlight is wired active-low (higher duty = dimmer).
+void applyBrightness()
+{
+#if defined(TFT_BACKLIGHT_ON) && (TFT_BACKLIGHT_ON == HIGH)
+    uint32_t duty = (uint32_t)(brightness * 255L / 100);
+#else
+    uint32_t duty = (uint32_t)(255 - brightness * 255L / 100);
+#endif
+    ledcWrite(BACKLIGHT_LEDC_CHANNEL, duty);
 }
 
 void saveSettings()
@@ -1689,8 +1685,10 @@ void saveSettings()
     doc["useScreenSaver"] = useScreenSaver;
     doc["bigClockColour"] = bigClockColour;
     doc["bigClockShowsUtc"] = bigClockShowsUtc;
+    doc["bigClockStyle"] = bigClockStyle;
     doc["weatherIntervalMin"] = weatherIntervalMin;
     doc["screenSaverTimeout"] = screenSaverTimeout;
+    doc["brightness"] = brightness;
 
     fs::File file = SPIFFS.open("/settings.json", "w");
 
@@ -1774,58 +1772,6 @@ void handleSave()
     server.send(200, "text/html", "<h1>✅ Settings saved!</h1><a href='/'>Back</a>");
 }
 
-void drawOrredrawStaticElementsOLD()
-{
-    // Only run if we want to refresh the frames
-    if (refreshFrames)
-    {
-        refreshFramesCounter++;
-        if (refreshFramesCounter < 2)
-        {
-            return; // Wait for second execution
-        }
-        refreshFrames = false;
-        refreshFramesCounter = 0;
-    }
-    previousLocalTime = "";
-    previousUTCtime = "";
-    tft.setFreeFont(&Orbitron_Medium8pt7b);
-    tft.fillRect(25, 0 + 85 - 10, 270, 20, TFT_BLACK);
-    tft.fillRect(25, 106 + 85 - 10, 270, 20, TFT_BLACK);
-
-    // 🟩 Local Frame
-    tft.fillRect(0, 0, 320, 87, TFT_BLACK); // Clear previous frame
-    tft.drawRoundRect(1, 1, 318, 85, 4, TFT_BLACK);
-
-    tft.drawRoundRect(0, 0, 320, 87, 5, localFrameColour);
-    if (doubleFrame)
-    {
-        tft.drawRoundRect(1, 1, 318, 85, 4, localFrameColour);
-        tft.drawRoundRect(2, 2, 316, 83, 4, localFrameColour);
-        tft.drawRoundRect(3, 3, 314, 81, 4, localFrameColour);
-    }
-
-    // 🟦 Local Time Label
-
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawCentreString(localTimeLabel, 160, 76, 1);
-
-    // 🟥 UTC Frame
-    tft.fillRect(0, 105, 320, 87, TFT_BLACK); // Clear previous frame
-    tft.drawRoundRect(1, 106, 318, 85, 4, TFT_BLACK);
-
-    tft.drawRoundRect(0, 105, 320, 87, 5, utcFrameColour);
-    if (doubleFrame)
-    {
-        tft.drawRoundRect(1, 106, 318, 85, 4, utcFrameColour);
-        tft.drawRoundRect(2, 107, 316, 83, 4, utcFrameColour);
-        tft.drawRoundRect(3, 108, 314, 81, 4, utcFrameColour);
-    }
-
-    // ⬜ UTC Label
-    tft.drawCentreString(utcTimeLabel, 160, 76 + 105, 1);
-}
-
 void drawOrredrawStaticElements()
 {
     // Only run if we want to refresh the frames
@@ -1843,71 +1789,75 @@ void drawOrredrawStaticElements()
     previousLocalTime = "";
     previousUTCtime = "";
     tft.setFreeFont(&Orbitron_Medium8pt7b);
-    tft.fillRect(25, 0 + 85 - 10, 270, 20, TFT_BLACK);
-    tft.fillRect(25, 106 + 85 - 10, 270, 20, TFT_BLACK);
+    tft.fillRect(25, FRAME_TOP1 + FRAME_H - 10, 270, 20, TFT_BLACK);
+    tft.fillRect(25, FRAME_TOP2 + FRAME_H - 10, 270, 20, TFT_BLACK);
 
     // 🟩 Local Frame
-    tft.fillRect(0, 0, 320, 87, TFT_BLACK); // Clear previous frame
+    tft.fillRect(0, FRAME_TOP1, 320, FRAME_H, TFT_BLACK); // Clear previous frame
 
-    tft.drawRoundRect(1, 1, 319, 85, 5, localFrameColour);
+    tft.drawRoundRect(1, FRAME_TOP1 + 1, 319, FRAME_H - 2, 5, localFrameColour);
     if (doubleFrame)
     {
-        tft.drawRoundRect(1, 1, 319, 85, 4, localFrameColour);
-        tft.drawRoundRect(2, 2, 317, 83, 4, localFrameColour);
-        tft.drawRoundRect(3, 3, 315, 81, 4, localFrameColour);
+        tft.drawRoundRect(1, FRAME_TOP1 + 1, 319, FRAME_H - 2, 4, localFrameColour);
+        tft.drawRoundRect(2, FRAME_TOP1 + 2, 317, FRAME_H - 4, 4, localFrameColour);
+        tft.drawRoundRect(3, FRAME_TOP1 + 3, 315, FRAME_H - 6, 4, localFrameColour);
     }
 
     // 🟦 Local Time Label
 
-    // Both captions sit right of the frame's centre line.
+    // The caption sits on the frame's centre line; the locator now anchors to
+    // the left edge instead of the right, because at this font's width (8
+    // monospace chars, ~104 px) a right-aligned locator collided with the
+    // default "  QTH Time  " caption and silently failed to draw at all.
     const int LABEL_CX = 180;
-    const int LOCATOR_RIGHT = 312;
+    const int LOCATOR_LEFT = 8;
+    const int LABEL_Y1 = FRAME_TOP1 + FRAME_H - 11;   // same 11 px clearance to the frame's bottom edge as before
+    const int LOCATOR_Y1 = LABEL_Y1;                  // shares the caption's baseline - see below
 
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawCentreString(localTimeLabel, LABEL_CX, 76, 1);
+    tft.drawCentreString(localTimeLabel, LABEL_CX, LABEL_Y1, 1);
 
     // The Maidenhead locator belongs to the QTH, so it goes on the caption row
-    // of the QTH frame, right-aligned inside it and in the caption own colour.
-    // The row is clear of the big digits, which stop above it.
+    // of the QTH frame, in the caption's own colour.  The row is clear of the
+    // big digits, which stop above it.
     {
         char loc[10];
         maidenhead(latitude, longitude, loc, sizeof(loc));
 
         // Measured while the caption font is still the current one.
-        int labelRight = LABEL_CX + tft.textWidth(localTimeLabel) / 2;
+        int labelLeft = LABEL_CX - tft.textWidth(localTimeLabel) / 2;
 
-        // Eight characters next to the caption need a narrower face, and a
-        // lighter one reads as an annotation rather than a second caption.
-        // Drawn four pixels lower so the two share a baseline: the caption
-        // font carries 15 pixels of ascent against this one's 11.
-        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        int locLeft = LOCATOR_RIGHT - tft.textWidth(loc);
+        // The grid locator is real operating information, not just an
+        // annotation next to the caption, so it gets a bolder, brighter face -
+        // this font's ascent (15 px) matches the caption's, so the two share a
+        // baseline with no extra offset needed.
+        tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+        int locRight = LOCATOR_LEFT + tft.textWidth(loc);
 
         // The caption is renamable from the web page, so check the two still
         // clear each other rather than letting them collide.
-        if (locLeft > labelRight + 8)
+        if (locRight < labelLeft - 8)
         {
-            tft.setTextDatum(TR_DATUM);
-            tft.drawString(loc, LOCATOR_RIGHT, 80);
-            tft.setTextDatum(TL_DATUM);
+            tft.setTextColor(TFT_CYAN, TFT_BLACK);
+            tft.drawString(loc, LOCATOR_LEFT, LOCATOR_Y1);
         }
 
         tft.setFreeFont(&Orbitron_Medium8pt7b);   // hand the font back
     }
 
     // 🟥 UTC Frame
-    tft.fillRect(0, 105, 320, 87, TFT_BLACK); // Clear previous frame
+    tft.fillRect(0, FRAME_TOP2, 320, FRAME_H, TFT_BLACK); // Clear previous frame
 
-    tft.drawRoundRect(1, 105, 319, 85, 5, utcFrameColour);
+    tft.drawRoundRect(1, FRAME_TOP2, 319, FRAME_H - 2, 5, utcFrameColour);
     if (doubleFrame)
     {
-        tft.drawRoundRect(1, 106, 319, 85, 4, utcFrameColour);
-        tft.drawRoundRect(2, 107, 317, 83, 4, utcFrameColour);
-        tft.drawRoundRect(3, 108, 315, 81, 4, utcFrameColour);
+        tft.drawRoundRect(1, FRAME_TOP2 + 1, 319, FRAME_H - 2, 4, utcFrameColour);
+        tft.drawRoundRect(2, FRAME_TOP2 + 2, 317, FRAME_H - 4, 4, utcFrameColour);
+        tft.drawRoundRect(3, FRAME_TOP2 + 3, 315, FRAME_H - 6, 4, utcFrameColour);
     }
 
     // ⬜ UTC Label
-    tft.drawCentreString(utcTimeLabel, LABEL_CX, 76 + 105, 1);
+    tft.drawCentreString(utcTimeLabel, LABEL_CX, FRAME_TOP2 + FRAME_H - 11, 1);
 }
 
 void mountAndListSPIFFS(uint8_t levels, bool listContent)
@@ -2056,6 +2006,7 @@ static void activatePage(uint8_t page)
         // immediately after the screen clear.
         bigClockColonState = -1;
         bigClockLabelDirty = true;
+        bigClockFullRedraw = true;
         break;
     case 8:
         redrawSatellitePage = true;
@@ -2109,6 +2060,7 @@ void handleTouchToRotatePage()
                 tft.fillScreen(TFT_BLACK);
                 bigClockColonState = -1;
                 bigClockLabelDirty = true;
+                bigClockFullRedraw = true;
                 return;
             }
 
@@ -2143,32 +2095,34 @@ void handleTouchToRotatePage()
 
 void drawMainPropagationPage()
 {
-
     tft.fillScreen(TFT_BLACK);
+    drawPageHeader("BAND CONDITIONS");
+
     // draw frames
     //  Define positions and dimensions
     int dayX = 10;
     int nightX = 170;
-    int blockY = 12;
     int blockWidth = 140;
-    int blockHeight = 143;
     int cornerRadius = 8;
 
+    // DAY / NIGHT labels sit above their box now instead of notched into its
+    // border - that notch trick clashed with the header rule at y=19 and isn't
+    // how the newer pages label anything.
+    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawCentreString("DAY", 80, 21, 1);
+    tft.drawCentreString("NIGHT", 240, 21, 1);
+
+    int blockY = 39;
+    int blockHeight = 114;
     tft.drawRoundRect(dayX, blockY, blockWidth, blockHeight, cornerRadius, TFT_DARKGREY);
     tft.drawRoundRect(nightX, blockY, blockWidth, blockHeight, cornerRadius, TFT_DARKGREY);
-    tft.fillRect(80 - 27, 0, 54, 20, TFT_BLACK);
-    tft.fillRect(240 - 38, 0, 76, 20, TFT_BLACK);
-
-    // Draw headers
-    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-    tft.setTextColor(TFT_LIGHTGREY);
-    tft.drawCentreString("DAY", 80, 2, 1);
-    tft.drawCentreString("NIGHT", 240, 2, 1);
 
     // Band conditions by time
     tft.setFreeFont(&JetBrainsMono_Bold15pt7b);
 
-    int yStart = 22;
+    int yStart = 45;
+    int rowSpacing = 27;
     for (int i = 0; i < 4; i++)
     {
         // DAY
@@ -2178,7 +2132,7 @@ void drawMainPropagationPage()
         uint16_t color = cond == "Good" ? TFT_GREEN : cond == "Fair" ? TFT_YELLOW
                                                                      : TFT_RED;
         tft.setTextColor(color);
-        tft.drawCentreString(band, 80, yStart + i * 32, 1);
+        tft.drawCentreString(band, 80, yStart + i * rowSpacing, 1);
 
         // NIGHT
         band = solarData.bandConditions[i + 4].name;
@@ -2187,33 +2141,28 @@ void drawMainPropagationPage()
                                                             : TFT_RED;
         tft.setTextColor(color);
 
-        tft.drawCentreString(band, 240, yStart + i * 32, 1);
+        tft.drawCentreString(band, 240, yStart + i * rowSpacing, 1);
     }
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     tft.drawCentreString("Updated: " + solarData.updated, 160, 160, 1);
-    // tft.drawCentreString("Updating...", 80, 185, 1);
-    // tft.drawCentreString("Updating...", 240, 185, 1);
 
     int LocalX = 10;
     int UTCX = 170;
-    blockY = 190;
-    blockWidth = 140;
-    blockHeight = 48;
-    cornerRadius = 8;
 
+    // Same "label above a plain box" treatment as DAY/NIGHT.  The clock digits
+    // (drawLOCALTime()/drawUTCTime() in loop(), fixed at y=205) still land
+    // comfortably inside this box - only its top edge and height changed.
+    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawCentreString("Local", 80, 176, 1);
+    tft.drawCentreString("UTC", 240, 176, 1);
+
+    blockY = 194;
+    blockHeight = 44;
     tft.drawRoundRect(LocalX, blockY, blockWidth, blockHeight, cornerRadius, TFT_DARKGREY);
     tft.drawRoundRect(UTCX, blockY, blockWidth, blockHeight, cornerRadius, TFT_DARKGREY);
-    tft.fillRect(80 - 36, blockY - 15, 72, 35, TFT_BLACK);
-    tft.fillRect(240 - 26, blockY - 15, 52, 35, TFT_BLACK);
-
-    // Draw headers
-    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-    tft.setTextColor(TFT_LIGHTGREY);
-
-    tft.drawCentreString("Local", 80, 179, 1);
-    tft.drawCentreString("UTC", 240, 179, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -2510,9 +2459,18 @@ void drawUTCTime(const String &timeStr, int x, int y, uint16_t digitColor, uint1
 
 void drawSolarSummaryPage1()
 {
-    int y = 13;
-    int lineSpacing = 18;
+    // 13 rows is the tightest fit of the three solar pages, hence the slightly
+    // shorter lineSpacing than pages 2 and 3 - it's what keeps the last row
+    // clear of the bottom edge once the header claims the top of the screen.
+    //
+    // tft.print()/setCursor() treats y as the text BASELINE, not its top (only
+    // drawString() does that top-to-baseline conversion) - so y has to clear
+    // the rule by a whole ascent (~10 px for this font), not just a few px, or
+    // the first row's glyphs poke up into the header.
+    int y = 32;
+    int lineSpacing = 16;
     tft.fillScreen(TFT_BLACK);
+    drawPageHeaderWithClock("SOLAR INDICES", true);
 
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     tft.setTextSize(1);
@@ -2609,9 +2567,12 @@ void drawSolarSummaryPage1()
 
 void drawSolarSummaryPage2()
 {
-    int y = 13;
+    // See drawSolarSummaryPage1(): y is a print()/setCursor() baseline, so it
+    // has to clear the rule by a full ascent, not just a few pixels.
+    int y = 32;
     int lineSpacing = 18;
     tft.fillScreen(TFT_BLACK);
+    drawPageHeaderWithClock("GEOMAG / MUF", true);
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     tft.setTextSize(1);
 
@@ -2666,11 +2627,16 @@ void drawSolarSummaryPage2()
 
 void drawSolarSummaryPage3()
 {
-    int y = 20;
+    // See drawSolarSummaryPage1(): y is a print()/setCursor() baseline, so it
+    // has to clear the rule by a full ascent, not just a few pixels.
+    int y = 32;
     int lineSpacing = 18;
     int paragraphSpacing = 6;
 
     tft.fillScreen(TFT_BLACK);
+    // "VHF/UHF CONDITIONS" ran right up against the corner clock at this
+    // font's width - shortened so the two don't touch.
+    drawPageHeaderWithClock("VHF/UHF", true);
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     tft.setTextSize(1);
 
@@ -2745,10 +2711,20 @@ void drawSolarSummaryPage3()
     }
 }
 
+// Shared with drawWiFiQualityPage()/drawNtpStatus(): the list starts right
+// under the page header, one row per field, all at the same 18 px pitch.
+//
+// This is a print()/setCursor() list, where y is the text BASELINE rather than
+// its top (only drawString() does the top-to-baseline conversion) - so Y0 has
+// to clear the header rule by a whole ascent (~10 px), not just a few pixels,
+// or the first row's glyphs poke up into the title.
+static const int WIFI_Y0 = 32;
+static const int WIFI_LINE_H = 18;
+
 void updateWiFiSignalDisplay()
 {
     // Pin the font rather than inheriting whatever was selected last.
-    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     tft.setTextSize(1);
 
     int rssi = WiFi.RSSI();
@@ -2764,9 +2740,9 @@ void updateWiFiSignalDisplay()
 
     // Coordinates based on drawWiFiQualityPage
     int rssiX = 130;
-    int rssiY = 15 + 3 * 18;
+    int rssiY = WIFI_Y0 + 3 * WIFI_LINE_H;
     int signalX = 130;
-    int signalY = 15 + 4 * 18;
+    int signalY = WIFI_Y0 + 4 * WIFI_LINE_H;
 
     tft.setTextColor(TFT_BLACK, TFT_BLACK); // erase with background color
 
@@ -2791,6 +2767,7 @@ void updateWiFiSignalDisplay()
     tft.print(": ");
     tft.print(newSignal);
 
+    drawHeaderCornerClock(true);
     drawNtpStatus();
 
     // Save current values for next comparison
@@ -2872,6 +2849,325 @@ static void maidenhead(double latDeg, double lonDeg, char *out, size_t n)
     out[8] = 0;
 }
 
+// =============================================================================
+// Big clock (page 7), in three styles
+//
+// All three share the QTH/UTC badge at the foot of the screen and the touch
+// target that goes with it, so only the area above y=200 differs between them.
+// =============================================================================
+
+// --- style 0: seven segment --------------------------------------------------
+static void drawBigClockSevenSeg(long shownEpoch, bool full)
+{
+    // One second on, one second off.  Driven by the parity of the clock's own
+    // seconds rather than a millis() timer, so the blink stays in step with the
+    // time on screen instead of drifting against it.
+    int8_t wantColon = (timeClient.getEpochTime() % 2 == 0) ? 1 : 0;
+    if (full || wantColon != bigClockColonState)
+    {
+        bigClockColonState = wantColon;
+        tft.setFreeFont(&digits60pt7b);
+        tft.setTextColor(wantColon ? bigClockColour : TFT_BLACK);
+        tft.drawString(":", 151, 65, 1);
+    }
+
+    struct tm *ptm = gmtime((time_t *)&shownEpoch);
+    char hhmm[6];
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", ptm->tm_hour, ptm->tm_min);
+
+    const int digitX[4] = {5, 78, 180, 253};
+    const int digitY = 65;
+
+    if (full || String(hhmm) != LASTbigClockTimeStr)
+    {
+        // Set the font at the point of use: the badge draws with its own.
+        tft.setFreeFont(&digits60pt7b);
+
+        char now[4] = {hhmm[0], hhmm[1], hhmm[3], hhmm[4]};
+        for (int i = 0; i < 4; i++)
+        {
+            if (!full && now[i] == bigClockLastDigit[i]) continue;
+
+            tft.setTextColor(TFT_BLACK);
+            tft.drawString(String(bigClockLastDigit[i]), digitX[i], digitY, 1);
+            tft.setTextColor(bigClockColour);
+            tft.drawString(String(now[i]), digitX[i], digitY, 1);
+            bigClockLastDigit[i] = now[i];
+        }
+        LASTbigClockTimeStr = hhmm;
+    }
+}
+
+// --- style 1: hands ----------------------------------------------------------
+// The dial furniture is painted once.  After that only the hands move, and they
+// are kept strictly inside the ring of numerals, so erasing one can never take
+// a bite out of the face.
+// The numerals sit outside the tick ring rather than inside it.  Inside, the
+// two-digit ones reach about 15 px diagonally from their centre, which leaves
+// no room between the hub and the ticks for a hand that does not touch them -
+// and a hand that touches one takes a bite out of it when it is erased.
+static const int DIAL_CX = 160, DIAL_CY = 100;
+static const int DIAL_R  = 74;          // the ring itself
+static const int TICK_OUT = 73;
+static const int TICK_IN_HOUR = 63;
+static const int TICK_IN_MIN  = 68;
+// 90 is as far out as the numerals can go: any further and the 12 runs off the
+// top of the screen.  The ring is drawn inside them rather than the other way
+// round, which is what keeps the two clear of each other.
+static const int DIAL_NUMERAL_R = 90;
+static const int HAND_HOUR = 40, HAND_MIN = 56, HAND_SEC = 58;
+
+static int lastHandH = -1, lastHandM = -1, lastHandS = -1;
+
+// A hand is a triangle from a base across the hub to a point at the tip, which
+// makes it taper like a real one and lets it be erased exactly.
+static void drawHand(float deg, int len, int halfWidth, uint16_t colour)
+{
+    float a = deg * DEG_TO_RAD;
+    float sn = sinf(a), cs = cosf(a);
+
+    int tx = DIAL_CX + (int)lroundf(len * sn);
+    int ty = DIAL_CY - (int)lroundf(len * cs);
+    int x1 = DIAL_CX + (int)lroundf(halfWidth * cs);
+    int y1 = DIAL_CY + (int)lroundf(halfWidth * sn);
+    int x2 = DIAL_CX - (int)lroundf(halfWidth * cs);
+    int y2 = DIAL_CY - (int)lroundf(halfWidth * sn);
+
+    tft.fillTriangle(tx, ty, x1, y1, x2, y2, colour);
+}
+
+static void drawSecondHand(float deg, uint16_t colour)
+{
+    float a = deg * DEG_TO_RAD;
+    float sn = sinf(a), cs = cosf(a);
+    tft.drawLine(DIAL_CX - (int)lroundf(14 * sn), DIAL_CY + (int)lroundf(14 * cs),
+                 DIAL_CX + (int)lroundf(HAND_SEC * sn), DIAL_CY - (int)lroundf(HAND_SEC * cs),
+                 colour);
+}
+
+static void drawDialFace()
+{
+    tft.drawCircle(DIAL_CX, DIAL_CY, DIAL_R, TFT_DARKGREY);
+
+    for (int i = 0; i < 60; i++)
+    {
+        float a = i * 6.0f * DEG_TO_RAD;
+        float sn = sinf(a), cs = cosf(a);
+        bool onHour = (i % 5 == 0);
+        int inner = onHour ? TICK_IN_HOUR : TICK_IN_MIN;
+        uint16_t colour = onHour ? TFT_LIGHTGREY : TFT_DARKGREY;
+
+        tft.drawLine(DIAL_CX + (int)lroundf(inner * sn), DIAL_CY - (int)lroundf(inner * cs),
+                     DIAL_CX + (int)lroundf(TICK_OUT * sn),
+                     DIAL_CY - (int)lroundf(TICK_OUT * cs), colour);
+    }
+
+    tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    for (int h = 1; h <= 12; h++)
+    {
+        float a = h * 30.0f * DEG_TO_RAD;
+        tft.drawString(String(h),
+                       DIAL_CX + (int)lroundf(DIAL_NUMERAL_R * sinf(a)),
+                       DIAL_CY - (int)lroundf(DIAL_NUMERAL_R * cosf(a)));
+    }
+    tft.setTextDatum(TL_DATUM);
+}
+
+static void drawBigClockAnalog(long shownEpoch, bool full)
+{
+    struct tm *ptm = gmtime((time_t *)&shownEpoch);
+    int hh = ptm->tm_hour % 12, mm = ptm->tm_min, ss = ptm->tm_sec;
+
+    if (full)
+    {
+        drawDialFace();
+        lastHandH = lastHandM = lastHandS = -1;
+    }
+    else if (ss == lastHandS && mm == lastHandM && hh == lastHandH)
+    {
+        return;
+    }
+
+    // Rub out only what has actually moved.  The hour and minute hands are then
+    // redrawn unconditionally, which also repairs the gash the second hand
+    // leaves behind where it crossed them.
+    if (lastHandS >= 0)
+        drawSecondHand(lastHandS * 6.0f, TFT_BLACK);
+    if (lastHandM >= 0 && (mm != lastHandM || hh != lastHandH))
+    {
+        drawHand(lastHandM * 6.0f, HAND_MIN, 4, TFT_BLACK);
+        drawHand(lastHandH * 30.0f + lastHandM * 0.5f, HAND_HOUR, 5, TFT_BLACK);
+    }
+
+    drawHand(hh * 30.0f + mm * 0.5f, HAND_HOUR, 5, bigClockColour);
+    drawHand(mm * 6.0f, HAND_MIN, 4, bigClockColour);
+    drawSecondHand(ss * 6.0f, TFT_RED);
+    tft.fillCircle(DIAL_CX, DIAL_CY, 4, bigClockColour);
+
+    lastHandH = hh;
+    lastHandM = mm;
+    lastHandS = ss;
+}
+
+// --- style 2: binary ---------------------------------------------------------
+// One column per decimal digit, hours through seconds, least significant bit at
+// the bottom - the BCD layout every binary clock uses.  The decimal value is
+// printed under each column, because a binary clock nobody can read is an
+// ornament rather than a clock.
+static const uint8_t BIN_BITS[6] = {2, 4, 3, 4, 3, 4};
+static const int BIN_X0 = 52, BIN_DX = 44;
+static const int BIN_Y0 = 166, BIN_DY = 38;
+static const int BIN_R  = 13;
+
+static int8_t lastBinDigit[6] = {-1, -1, -1, -1, -1, -1};
+
+static void drawBigClockBinary(long shownEpoch, bool full)
+{
+    struct tm *ptm = gmtime((time_t *)&shownEpoch);
+    uint8_t digits[6] = {
+        (uint8_t)(ptm->tm_hour / 10), (uint8_t)(ptm->tm_hour % 10),
+        (uint8_t)(ptm->tm_min / 10),  (uint8_t)(ptm->tm_min % 10),
+        (uint8_t)(ptm->tm_sec / 10),  (uint8_t)(ptm->tm_sec % 10)};
+
+    if (full)
+    {
+        for (int i = 0; i < 6; i++) lastBinDigit[i] = -1;
+
+        // Bit weights down the left edge, so the columns can be read off.
+        tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextDatum(MR_DATUM);
+        for (int b = 0; b < 4; b++)
+            tft.drawString(String(1 << b), 26, BIN_Y0 - b * BIN_DY);
+
+        // Which pair of columns is which.
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        const char *groups[3] = {"HOUR", "MIN", "SEC"};
+        for (int g = 0; g < 3; g++)
+            tft.drawString(groups[g], BIN_X0 + (int)((g * 2 + 0.5f) * BIN_DX), 30);
+        tft.setTextDatum(TL_DATUM);
+    }
+
+    for (int i = 0; i < 6; i++)
+    {
+        if (!full && digits[i] == lastBinDigit[i]) continue;
+
+        int cx = BIN_X0 + i * BIN_DX;
+        for (int b = 0; b < BIN_BITS[i]; b++)
+        {
+            int cy = BIN_Y0 - b * BIN_DY;
+            bool on = (digits[i] >> b) & 1;
+            if (on)
+            {
+                tft.fillCircle(cx, cy, BIN_R, bigClockColour);
+            }
+            else
+            {
+                tft.fillCircle(cx, cy, BIN_R, TFT_BLACK);
+                tft.drawCircle(cx, cy, BIN_R, TFT_DARKGREY);
+            }
+        }
+
+        // The decimal reading underneath.
+        tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(String(digits[i]), cx, 194);
+        tft.setTextDatum(TL_DATUM);
+
+        lastBinDigit[i] = digits[i];
+    }
+}
+
+// --- dispatch ----------------------------------------------------------------
+void drawBigClockPage()
+{
+    bool full = bigClockFullRedraw;
+    bigClockFullRedraw = false;
+
+    long shownEpoch = timeClient.getEpochTime() +
+                      (bigClockShowsUtc ? 0L : (long)tOffset * 3600L);
+
+    switch (bigClockStyle)
+    {
+    case BIGCLOCK_ANALOG: drawBigClockAnalog(shownEpoch, full); break;
+    case BIGCLOCK_BINARY: drawBigClockBinary(shownEpoch, full); break;
+    default:              drawBigClockSevenSeg(shownEpoch, full); break;
+    }
+
+    // Drawn last so nothing the style above paints near the foot of the
+    // screen - the binary style's decimal readout at y=194 sits right against
+    // it - can ever come back and overwrite a freshly-changed label.
+    if (bigClockLabelDirty)
+    {
+        drawBigClockModeBadge();
+        bigClockLabelDirty = false;
+    }
+}
+
+// =============================================================================
+// Screen capture
+//
+// The ILI9341 can be read back over the same SPI bus it is written on, so a
+// screenshot is the panel's own memory rather than a redrawn approximation of
+// it.  The image is streamed a row at a time: a whole 320x240 frame is 150 kB,
+// which is more than this board has to spare.
+// =============================================================================
+static void handleScreenshot()
+{
+    const int W = 320, H = 240;
+    const uint32_t rowBytes = (uint32_t)W * 3;
+    const uint32_t pixelBytes = rowBytes * H;
+    const uint32_t fileSize = 54 + pixelBytes;
+
+    uint8_t header[54];
+    memset(header, 0, sizeof(header));
+    header[0] = 'B';
+    header[1] = 'M';
+    memcpy(header + 2, &fileSize, 4);
+    uint32_t dataOffset = 54;
+    memcpy(header + 10, &dataOffset, 4);
+    uint32_t dibSize = 40;
+    memcpy(header + 14, &dibSize, 4);
+    int32_t bw = W, bh = H;
+    memcpy(header + 18, &bw, 4);
+    memcpy(header + 22, &bh, 4);
+    uint16_t planes = 1, bpp = 24;
+    memcpy(header + 26, &planes, 2);
+    memcpy(header + 28, &bpp, 2);
+    memcpy(header + 34, &pixelBytes, 4);
+
+    server.setContentLength(fileSize);
+    server.send(200, "image/bmp", "");
+    server.sendContent((const char *)header, sizeof(header));
+
+    // Static rather than automatic: 1.6 kB is a lot to ask of the loop stack.
+    static uint16_t line[W];
+    static uint8_t  row[W * 3];
+
+    // BMP stores its rows bottom up.
+    for (int y = H - 1; y >= 0; y--)
+    {
+        tft.readRect(0, y, W, 1, line);
+        for (int x = 0; x < W; x++)
+        {
+            // readRect hands back the pixel with its bytes the other way round
+            // from the way drawString wrote it, which leaves white and black
+            // looking right and everything else on the wrong channel.
+            uint16_t raw = line[x];
+            uint16_t c = (uint16_t)((raw >> 8) | (raw << 8));
+            row[x * 3 + 0] = (uint8_t)((c & 0x001F) << 3);   // blue
+            row[x * 3 + 1] = (uint8_t)((c & 0x07E0) >> 3);   // green
+            row[x * 3 + 2] = (uint8_t)((c & 0xF800) >> 8);   // red
+        }
+        server.sendContent((const char *)row, sizeof(row));
+    }
+    server.sendContent("", 0);
+}
+
 void drawBigClockModeBadge()
 {
     // No frame: just clear the strip so the previous label cannot show through.
@@ -2890,6 +3186,47 @@ void drawBigClockModeBadge()
     // has to hand it back.
     tft.setTextDatum(TL_DATUM);
     tft.setFreeFont(&digits60pt7b);
+}
+
+// =============================================================================
+// Shared page chrome
+//
+// The satellite/weather/beacon/sun-moon/DX pages all hand-roll the same title +
+// rule (and, where the page's own content doesn't already show the time, the
+// same top-right corner clock).  These two helpers give the older pages (1-6)
+// that same look without duplicating the literal coordinates six more times.
+// =============================================================================
+static void drawPageHeader(const char *title)
+{
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&Orbitron_Medium8pt7b);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(title, 6, 2);
+    tft.drawFastHLine(4, 19, 312, TFT_DARKGREY);
+}
+
+// The corner clock alone, so a page with its own 1 Hz tick (e.g. the WiFi page)
+// can refresh just this instead of redrawing the whole header every second.
+static void drawHeaderCornerClock(bool utc)
+{
+    long shownEpoch = timeClient.getEpochTime() + (utc ? 0L : (long)tOffset * 3600L);
+    struct tm *ptm = gmtime((time_t *)&shownEpoch);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d %s",
+              ptm->tm_hour, ptm->tm_min, ptm->tm_sec, utc ? "UTC" : "LOC");
+
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, 314, 4);
+    tft.setTextDatum(TL_DATUM);
+}
+
+static void drawPageHeaderWithClock(const char *title, bool utc)
+{
+    drawPageHeader(title);
+    drawHeaderCornerClock(utc);
 }
 
 // Every NTP poll goes through here so the sync state is recorded in one place.
@@ -2911,7 +3248,7 @@ void drawNtpStatus()
 {
     const int labelX = 10;
     const int valueX = 130;
-    const int textY = 15 + 10 * 18;   // the row after "Hostname 2"
+    const int textY = WIFI_Y0 + 10 * WIFI_LINE_H;   // the row after "Hostname 2"
 
     char value[40];
 
@@ -2934,7 +3271,7 @@ void drawNtpStatus()
 
     // Same erase-then-redraw idiom the rest of this page uses.
     static String lastValue = "";
-    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     tft.setTextSize(1);
 
     tft.setTextColor(TFT_BLACK, TFT_BLACK);
@@ -2957,13 +3294,13 @@ void drawNtpStatus()
 void drawWiFiQualityPage()
 {
     tft.fillScreen(TFT_BLACK);
-    // tft.setFreeFont(&UbuntuMono_Regular8pt7b);
-    tft.setFreeFont(&FreeSans9pt7b);
+    drawPageHeaderWithClock("WIFI STATUS", true);
 
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     tft.setTextSize(1);
 
-    int y = 15;
-    const int lineSpacing = 18;
+    int y = WIFI_Y0;
+    const int lineSpacing = WIFI_LINE_H;
 
     auto printLine = [&](const String &label, const String &value, uint16_t color = TFT_WHITE)
     {

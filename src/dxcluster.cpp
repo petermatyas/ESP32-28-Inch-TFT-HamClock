@@ -25,6 +25,7 @@ static uint16_t g_port     = 8000;
 // hides everything on first use looks like a broken page.
 static uint16_t g_bandMask = 0x0FFF;   // DX_BAND_COUNT bits
 static uint8_t  g_modeMask = 0x0F;     // DX_MODE_COUNT bits
+static bool     g_euOnly   = false;    // show only spots of European DX
 
 struct DxSpot
 {
@@ -52,6 +53,8 @@ static char g_status[48] = "starting";
 static bool g_filterOpen = false;
 static bool g_panelDirty = false;          // a chip was toggled, repaint it
 static volatile bool g_reconnect = false;  // settings changed - drop the link
+
+static void startTask();
 
 static void setStatus(const char *s)
 {
@@ -161,6 +164,104 @@ static uint8_t modeFromSpot(double kHz, const char *comment)
 }
 
 // =============================================================================
+// 2b. Continent (Europe) classification
+//
+// Amateur callsign prefixes are allocated in blocks per DXCC entity, not per
+// continent, so this is a lookup table rather than a formula.  It only needs
+// to answer "is this DXCC entity in Europe", not classify every prefix on
+// Earth by continent, since that is all the EU-only filter needs.
+//
+// A few entries are geographically outside Europe but share a prefix block
+// with one that is (Spain's Canary Islands EA8 and Ceuta & Melilla EA9 are
+// Africa; mainland/Balearic Spain EA/EA6 is Europe) - the longer, more
+// specific prefix is listed so it wins over the shorter block it carves out
+// of.  Russia is handled separately below: European and Asiatic Russia are
+// two different DXCC entities sharing one prefix block, split by the call
+// area digit rather than by letters.
+//
+// Known gap: Turkey's TA/TC block is not split by call area here, so all of
+// Turkey reads as outside Europe even though its European provinces issue
+// callsigns from the same block.
+// =============================================================================
+struct PrefixEntry { const char *prefix; bool europe; };
+
+static const PrefixEntry EU_PREFIXES[] = {
+    {"EA6", true}, {"EA8", false}, {"EA9", false}, {"EA", true},   // Spain / Canaries / Ceuta&Melilla
+    {"CT3", true}, {"CT", true}, {"CU", true},                     // Portugal / Madeira / Azores
+    {"SV5", true}, {"SV9", true}, {"SV", true}, {"SW", true}, {"SX", true}, {"SY", true}, {"SZ", true}, {"J4", true}, // Greece + islands
+    {"IS0", true}, {"IT9", true}, {"I", true},                     // Italy + Sardinia/Sicily
+    {"GD", true}, {"GI", true}, {"GJ", true}, {"GM", true}, {"GU", true}, {"GW", true}, {"G", true}, // UK + Crown dependencies
+    {"EI", true}, {"EJ", true},                                    // Ireland
+    {"F", true},                                                   // France (metropolitan)
+    {"ON", true}, {"OO", true}, {"OP", true}, {"OQ", true}, {"OR", true}, {"OS", true}, {"OT", true}, // Belgium
+    {"PA", true}, {"PB", true}, {"PC", true}, {"PD", true}, {"PE", true}, {"PF", true}, {"PG", true}, {"PH", true}, {"PI", true}, // Netherlands
+    {"DA", true}, {"DB", true}, {"DC", true}, {"DD", true}, {"DF", true}, {"DG", true}, {"DH", true},
+    {"DJ", true}, {"DK", true}, {"DL", true}, {"DM", true}, {"DO", true}, {"DQ", true}, {"DR", true}, // Germany
+    {"HB0", true}, {"HB", true},                                   // Switzerland + Liechtenstein
+    {"OE", true},                                                  // Austria
+    {"9H", true},                                                  // Malta
+    {"LX", true},                                                  // Luxembourg
+    {"OZ", true}, {"5P", true}, {"5Q", true},                      // Denmark
+    {"OY", true},                                                  // Faroe Islands
+    {"TF", true},                                                  // Iceland
+    {"LA", true}, {"LB", true}, {"LJ", true}, {"LN", true},        // Norway
+    {"JW", true}, {"JX", true},                                    // Svalbard / Jan Mayen
+    {"SM", true}, {"SA", true}, {"SB", true}, {"SC", true}, {"SD", true}, {"SE", true},
+    {"SF", true}, {"SG", true}, {"SH", true}, {"SI", true}, {"SJ", true}, {"SK", true}, {"SL", true}, // Sweden
+    {"OH", true}, {"OF", true}, {"OG", true}, {"OI", true}, {"OJ", true}, // Finland + Market Reef
+    {"ES", true},                                                  // Estonia
+    {"YL", true},                                                  // Latvia
+    {"LY", true},                                                  // Lithuania
+    {"SN", true}, {"SO", true}, {"SP", true}, {"SQ", true}, {"SR", true}, {"3Z", true}, {"HF", true}, // Poland
+    {"OK", true}, {"OL", true},                                    // Czech Republic
+    {"OM", true},                                                  // Slovakia
+    {"HA", true}, {"HG", true},                                    // Hungary
+    {"S5", true},                                                  // Slovenia
+    {"9A", true},                                                  // Croatia
+    {"E7", true},                                                  // Bosnia and Herzegovina
+    {"YU", true}, {"YT", true}, {"YZ", true},                      // Serbia
+    {"4O", true},                                                  // Montenegro
+    {"Z3", true}, {"Z6", true},                                    // North Macedonia / Kosovo
+    {"5B", true}, {"C4", true}, {"H2", true}, {"P3", true},        // Cyprus
+    {"YO", true}, {"YP", true}, {"YQ", true}, {"YR", true},        // Romania
+    {"LZ", true},                                                  // Bulgaria
+    {"ER", true},                                                  // Moldova
+    {"UR", true}, {"UT", true}, {"UU", true}, {"UV", true}, {"UW", true}, {"UX", true}, {"UY", true},
+    {"UZ", true}, {"EM", true}, {"EN", true}, {"EO", true},        // Ukraine
+    {"EW", true}, {"EU", true}, {"EV", true},                      // Belarus
+    {"C3", true},                                                  // Andorra
+    {"3A", true},                                                  // Monaco
+    {"T7", true},                                                  // San Marino
+    {"HV", true},                                                  // Vatican
+    {"ZB", true},                                                  // Gibraltar
+};
+
+static bool isEuropeanPrefix(const char *call)
+{
+    if (!call || !call[0]) return false;
+
+    // Russia/Kaliningrad: European call areas are 1, 2, 3, 4 and 6; the rest
+    // (0, 5, 7, 8, 9) are Asiatic Russia.
+    bool maybeRussian = (call[0] == 'R') ||
+                        (call[0] == 'U' && (call[1] == 'A' || call[1] == 'B' ||
+                                             call[1] == 'C' || call[1] == 'F' || call[1] == 'I'));
+    if (maybeRussian)
+    {
+        const char *d = call;
+        while (*d && !isdigit((unsigned char)*d)) d++;
+        if (isdigit((unsigned char)*d))
+            return *d == '1' || *d == '2' || *d == '3' || *d == '4' || *d == '6';
+    }
+
+    for (int len = 3; len >= 1; len--)
+        for (const PrefixEntry &e : EU_PREFIXES)
+            if ((int)strlen(e.prefix) == len && strncmp(call, e.prefix, len) == 0)
+                return e.europe;
+
+    return false;
+}
+
+// =============================================================================
 // 3. Persistence
 // =============================================================================
 
@@ -172,6 +273,7 @@ static void saveConfig()
     doc["port"]     = g_port;
     doc["bandMask"] = g_bandMask;
     doc["modeMask"] = g_modeMask;
+    doc["euOnly"]   = g_euOnly;
 
     fs::File f = SPIFFS.open(DX_CONFIG_FILE, "w");
     if (!f)
@@ -212,12 +314,13 @@ static void loadConfig()
     g_port     = doc["port"]     | g_port;
     g_bandMask = doc["bandMask"] | g_bandMask;
     g_modeMask = doc["modeMask"] | g_modeMask;
+    g_euOnly   = doc["euOnly"]   | g_euOnly;
 
     if (g_port == 0) g_port = 8000;
 
-    Serial.printf("DX: %s@%s:%u, bands 0x%03X modes 0x%X\n",
+    Serial.printf("DX: %s@%s:%u, bands 0x%03X modes 0x%X, euOnly %s\n",
                   g_call[0] ? g_call : "(no callsign)", g_host, g_port,
-                  g_bandMask, g_modeMask);
+                  g_bandMask, g_modeMask, g_euOnly ? "true" : "false");
 }
 
 // =============================================================================
@@ -474,6 +577,7 @@ static void buildConfigJson(String &out)
     doc["port"]     = g_port;
     doc["bandMask"] = g_bandMask;
     doc["modeMask"] = g_modeMask;
+    doc["euOnly"]   = g_euOnly;
     doc["status"]   = g_status;
     doc["seen"]     = g_spotsSeen;
 
@@ -511,13 +615,16 @@ static void handleSaveConfig(WebServer &server)
     }
     if (doc["bandMask"].is<int>()) g_bandMask = (uint16_t)(doc["bandMask"].as<int>() & 0x0FFF);
     if (doc["modeMask"].is<int>()) g_modeMask = (uint8_t)(doc["modeMask"].as<int>() & 0x0F);
+    if (doc["euOnly"].is<bool>()) g_euOnly = doc["euOnly"].as<bool>();
 
     saveConfig();
     Serial.printf("DX: config saved - %s@%s:%u\n",
                   g_call[0] ? g_call : "(no callsign)", g_host, g_port);
 
     // Drop the link so a changed callsign or node takes effect now rather than
-    // whenever the current session happens to end.
+    // whenever the current session happens to end.  The first callsign to
+    // arrive is also what brings the task into being.
+    if (g_call[0]) startTask();
     g_reconnect = true;
     server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
@@ -591,6 +698,7 @@ static const int CHIP_H = 26;
 static const int BAND_X0 = 6, BAND_W = 48, BAND_GAP = 4;
 static const int BAND_ROW0 = 54, BAND_ROW1 = 84;
 static const int MODE_X0 = 7, MODE_W = 72, MODE_GAP = 6, MODE_Y = 134;
+static const int CONT_X = 6, CONT_Y = 194, CONT_W = 90;
 
 static void bandChipRect(uint8_t i, int &x, int &y)
 {
@@ -678,9 +786,15 @@ static void drawFilterPanel(TFT_eSPI &tft)
     tft.drawFastHLine(4, 172, 312, TFT_DARKGREY);
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("CONTINENT", 6, 178);
+
+    tft.setFreeFont(&UbuntuMono_Regular8pt7b);
+    drawChip(tft, CONT_X, CONT_Y, CONT_W, "EU ONLY", g_euOnly);
+
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("tap a band or mode to show or hide it", 6, 180);
-    tft.drawString("spots already collected are kept either way", 6, 198);
+    tft.drawString("tap a chip to toggle it", 6, 224);
 }
 
 static bool spotPasses(const DxSpot &s)
@@ -688,6 +802,7 @@ static bool spotPasses(const DxSpot &s)
     if (s.band == DX_BAND_NONE) return false;
     if (!(g_bandMask & (1u << s.band))) return false;
     if (!(g_modeMask & (1u << s.mode))) return false;
+    if (g_euOnly && !isEuropeanPrefix(s.call)) return false;
     return true;
 }
 
@@ -822,6 +937,22 @@ void dxClusterDrawPage(TFT_eSPI &tft, time_t utcNow, bool fullRedraw)
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     tft.drawString(padded, DXX_TIME, DXY_FOOT);
+
+    // UTC in the corner: the spot times the node sends are in UTC, so this is
+    // what they should be read against.  Fixed width, so the opaque background
+    // wipes the previous value without a clearing rectangle.
+    {
+        time_t t = (time_t)utcNow;
+        struct tm tm_;
+        gmtime_r(&t, &tm_);
+        char clock[16];
+        snprintf(clock, sizeof(clock), "%02d:%02d:%02d UTC",
+                 tm_.tm_hour, tm_.tm_min, tm_.tm_sec);
+        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString(clock, 314, 4);
+        tft.setTextDatum(TL_DATUM);
+    }
 }
 
 // =============================================================================
@@ -851,17 +982,10 @@ bool dxClusterHandleTouch(int16_t x, int16_t y)
         return false;   // anything else is a page turn
     }
 
-    // While the panel is up it owns every touch, so a stray tap cannot page
-    // out from under it.
-    if (inside(x, y, DONE_X - 8, DONE_Y, DONE_W + 16, DONE_H + 12))
-    {
-        g_filterOpen = false;
-        saveConfig();
-        Serial.printf("DX: filter saved - bands 0x%03X modes 0x%X\n",
-                      g_bandMask, g_modeMask);
-        return true;
-    }
-
+    // While the panel is up it owns every touch, so a stray tap cannot page out
+    // from under it.  The chips are checked first; everything else closes the
+    // panel, the DONE button included.  Making the whole background dismiss it
+    // means a mistap on a miscalibrated panel can never strand the page.
     for (uint8_t i = 0; i < DX_BAND_COUNT; i++)
     {
         int cx, cy;
@@ -886,6 +1010,17 @@ bool dxClusterHandleTouch(int16_t x, int16_t y)
         }
     }
 
+    if (inside(x, y, CONT_X, CONT_Y - 2, CONT_W, CHIP_H + 4))
+    {
+        g_euOnly = !g_euOnly;
+        g_panelDirty = true;
+        return true;
+    }
+
+    g_filterOpen = false;
+    saveConfig();
+    Serial.printf("DX: filter saved - bands 0x%03X modes 0x%X, euOnly %s\n",
+                  g_bandMask, g_modeMask, g_euOnly ? "true" : "false");
     return true;
 }
 
@@ -976,6 +1111,18 @@ static void dxClusterSelfTest()
 // 10. Life cycle
 // =============================================================================
 
+// Core 0, low priority: the socket spends nearly all its time waiting, while
+// the drawing and the web server run on core 1.  The task is only started once
+// there is a callsign to log in with - its four kilobytes of stack are worth
+// keeping out of the heap on a clock whose owner does not use the cluster, and
+// boot is when the heap is tightest anyway.
+static void startTask()
+{
+    if (g_task) return;
+    xTaskCreatePinnedToCore(dxTask, "dxcluster", 4096, nullptr, 1, &g_task, 0);
+    Serial.println("DX: cluster task started");
+}
+
 void dxClusterBegin()
 {
     g_mutex = xSemaphoreCreateMutex();
@@ -983,10 +1130,7 @@ void dxClusterBegin()
     loadConfig();
 
     setStatus(g_call[0] ? "starting" : "no callsign - set one at /dx.html");
-
-    // Core 0, low priority: the socket spends nearly all its time waiting, and
-    // the drawing and the web server run on core 1.
-    xTaskCreatePinnedToCore(dxTask, "dxcluster", 4096, nullptr, 1, &g_task, 0);
+    if (g_call[0]) startTask();
 }
 
 void dxClusterReportHealth()

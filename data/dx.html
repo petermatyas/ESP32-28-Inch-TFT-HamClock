@@ -41,7 +41,7 @@
                         <div class="col-md-3">
                             <label class="form-label" for="call">Your callsign</label>
                             <input type="text" class="form-control text-uppercase" id="call"
-                                   maxlength="11" placeholder="e.g. HA5XYZ">
+                                   maxlength="11" placeholder="HA5XYZ">
                         </div>
                         <div class="col-md-5">
                             <label class="form-label" for="host">Cluster node</label>
@@ -87,6 +87,18 @@
                     <div class="mb-3">
                         <div class="text-secondary small mb-2">Modes</div>
                         <div id="modes" class="d-flex flex-wrap gap-2"></div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="text-secondary small mb-2">Continent</div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="euOnly">
+                            <label class="form-check-label" for="euOnly">Europe only</label>
+                        </div>
+                        <div class="form-text">
+                            Keeps spots whose DX station is a European callsign. Best-effort:
+                            a handful of prefixes (e.g. Turkey) aren't split finely enough to place precisely.
+                        </div>
                     </div>
 
                     <button class="btn btn-info" onclick="save()">&#128190; Save filter</button>
@@ -170,6 +182,7 @@ function loadConfig() {
         MODES = c.modes || [];
         bandMask = c.bandMask | 0;
         modeMask = c.modeMask | 0;
+        document.getElementById('euOnly').checked = !!c.euOnly;
         paintChips();
     }).catch(function () { toast('Could not read the settings from the clock', 'danger'); });
 }
@@ -185,7 +198,8 @@ function save() {
             host: document.getElementById('host').value.trim(),
             port: parseInt(document.getElementById('port').value, 10) || 8000,
             bandMask: bandMask,
-            modeMask: modeMask
+            modeMask: modeMask,
+            euOnly: document.getElementById('euOnly').checked
         })
     }).then(function (r) {
         if (!r.ok) throw new Error();
