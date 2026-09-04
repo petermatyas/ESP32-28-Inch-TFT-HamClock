@@ -6,7 +6,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="/favicon.ico" rel="icon" type="image/x-icon">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/@jaames/iro@5"></script>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600&display=swap" rel="stylesheet">
     <link href="/hamclock.css" rel="stylesheet">
     <script src="/hamclock.js"></script>
@@ -32,7 +31,6 @@
             font-size: 64px;
             color: #78d83c;
         }
-        #colorPicker, #bigColorPicker { margin: 0 auto; }
         #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
                  z-index: 1080; display: none; }
 
@@ -41,6 +39,7 @@
             0%   { transform: translateX(100%); }
             100% { transform: translateX(-100%); }
         }
+
     </style>
 </head>
 <body>
@@ -49,8 +48,8 @@
     <h1 class="text-center mb-1">Clock</h1>
     <p class="text-center text-secondary">
         Page 1's four faces: dual QTH/UTC, seven-segment, analogue and binary.
-        GPS position and other page-independent settings live on the
-        <a href="/" class="link-info">General page</a>.
+        GPS position, brightness and the colour style used everywhere - including
+        here - live on the <a href="/" class="link-info">General page</a>.
     </p>
 
     <div class="row">
@@ -106,61 +105,6 @@
         </div>
     </div>
 
-    <!-- Single-face colour -->
-    <div class="row" id="bigColorRow">
-        <div class="col-lg-10 offset-lg-1">
-            <div class="card mb-4">
-                <div class="card-body text-center">
-                    <h5 class="card-title text-start">Colour</h5>
-                    <div id="bigColorPicker"></div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Dual-face colours -->
-    <div class="row" id="dualColorRow">
-        <div class="col-lg-10 offset-lg-1">
-            <div class="card mb-4">
-                <div class="card-body">
-                    <h5 class="card-title">Colours</h5>
-                    <div class="row">
-                        <div class="col-md-6">
-                            <div class="text-secondary mb-2">Local (QTH)</div>
-                            <div class="form-check">
-                                <input class="form-check-input" type="radio" name="target" id="tLocalDigits"
-                                       onclick="setColorTarget('localTimeDigits')">
-                                <label class="form-check-label" for="tLocalDigits">Digits</label>
-                            </div>
-                            <div class="form-check">
-                                <input class="form-check-input" type="radio" name="target" id="tLocalFrame"
-                                       onclick="setColorTarget('localTimeFrame')">
-                                <label class="form-check-label" for="tLocalFrame">Frame</label>
-                            </div>
-                        </div>
-                        <div class="col-md-6">
-                            <div class="text-secondary mb-2">UTC</div>
-                            <div class="form-check">
-                                <input class="form-check-input" type="radio" name="target" id="tUtcDigits"
-                                       onclick="setColorTarget('utcTimeDigits')">
-                                <label class="form-check-label" for="tUtcDigits">Digits</label>
-                            </div>
-                            <div class="form-check">
-                                <input class="form-check-input" type="radio" name="target" id="tUtcFrame"
-                                       onclick="setColorTarget('utcTimeFrame')">
-                                <label class="form-check-label" for="tUtcFrame">Frame</label>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="text-center mt-3">
-                        <div id="colorPicker"></div>
-                        <div class="form-text">Pick which line to recolour above, then use the wheel.</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
     <div class="row" id="frameFontRow">
         <div class="col-lg-10 offset-lg-1">
             <div class="card mb-4">
@@ -186,16 +130,12 @@
                     <h5 class="card-title">Weather info banner</h5>
                     <p class="text-secondary small">
                         The scrolling line under the clocks, shown while this face is on screen.
+                        Its colour comes from the style chosen on the General page.
                     </p>
                     <div class="text-center mb-3" style="overflow:hidden; white-space:nowrap;">
                         <span id="bannerPreview" style="font-family:'Orbitron',sans-serif;">
                             Local Weather Information and Astronomical Data
                         </span>
-                    </div>
-                    <div class="form-check d-flex justify-content-center mb-3">
-                        <input class="form-check-input" type="radio" name="target" id="tBanner"
-                               onclick="setColorTarget('weatherBannerText')">
-                        <label class="form-check-label" for="tBanner">Banner colour (use the picker above)</label>
                     </div>
                     <label class="form-label" for="speedSlider">Scroll speed</label>
                     <input type="range" class="form-range" id="speedSlider" min="0" max="45" step="1" value="10">
@@ -224,13 +164,6 @@ function hexFrom565(rgb565) {
     return '#' + [r, g, b].map(function (x) { return x.toString(16).padStart(2, '0'); }).join('');
 }
 
-function rgb565FromHex(hex) {
-    var r = parseInt(hex.substr(1, 2), 16);
-    var g = parseInt(hex.substr(3, 2), 16);
-    var b = parseInt(hex.substr(5, 2), 16);
-    return (Math.round(r * 31 / 255) & 0x1F) << 11 | (Math.round(g * 63 / 255) & 0x3F) << 5 | (Math.round(b * 31 / 255) & 0x1F);
-}
-
 // --- face selector: show the dual-clock controls or the single-face ones ---
 var DUAL = 3;
 
@@ -241,11 +174,9 @@ function isDual() {
 function applyStyleVisibility() {
     var dual = isDual();
     document.getElementById('dualPreviewRow').hidden = !dual;
-    document.getElementById('dualColorRow').hidden = !dual;
     document.getElementById('frameFontRow').hidden = !dual;
     document.getElementById('bannerRow').hidden = !dual;
     document.getElementById('bigPreviewRow').hidden = dual;
-    document.getElementById('bigColorRow').hidden = dual;
     document.getElementById('badgeHint').hidden = dual;
 }
 
@@ -260,57 +191,6 @@ document.getElementById('styleSelect').addEventListener('change', function () {
         if (!r.ok) throw new Error();
         toast('Face saved', 'success');
     }).catch(function () { toast('Could not save the face', 'danger'); });
-});
-
-// --- dual-clock colour picker (4 targets) ---------------------------------
-var currentTarget = 'localTimeDigits';
-function setColorTarget(target) {
-    currentTarget = target;
-    document.getElementById({
-        localTimeDigits: 'tLocalDigits', localTimeFrame: 'tLocalFrame',
-        utcTimeDigits: 'tUtcDigits', utcTimeFrame: 'tUtcFrame',
-        weatherBannerText: 'tBanner'
-    }[target]).checked = true;
-}
-
-var colorPicker = new iro.ColorPicker('#colorPicker', { width: 200, color: '#76c72a' });
-
-colorPicker.on('color:change', function (color) {
-    var hex = color.hexString;
-    if (currentTarget === 'localTimeDigits') document.getElementById('localTime').style.color = hex;
-    else if (currentTarget === 'localTimeFrame') document.getElementById('localTime').style.borderColor = hex;
-    else if (currentTarget === 'utcTimeDigits') document.getElementById('utcTime').style.color = hex;
-    else if (currentTarget === 'utcTimeFrame') document.getElementById('utcTime').style.borderColor = hex;
-    else if (currentTarget === 'weatherBannerText') document.getElementById('bannerPreview').style.color = hex;
-});
-
-colorPicker.on('input:end', function (color) {
-    fetch('/setcolor', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: currentTarget, color: rgb565FromHex(color.hexString) })
-    }).then(function (r) {
-        if (!r.ok) throw new Error();
-        toast('Colour saved', 'success');
-    }).catch(function () { toast('Could not save that colour', 'danger'); });
-});
-
-// --- single-face colour picker (one target) -------------------------------
-var bigColorPicker = new iro.ColorPicker('#bigColorPicker', { width: 200, color: '#78d83c' });
-
-bigColorPicker.on('color:change', function (color) {
-    document.getElementById('bigClockTime').style.color = color.hexString;
-});
-
-bigColorPicker.on('input:end', function (color) {
-    fetch('/setcolor', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: 'bigClockTime', color: rgb565FromHex(color.hexString) })
-    }).then(function (r) {
-        if (!r.ok) throw new Error();
-        toast('Colour saved', 'success');
-    }).catch(function () { toast('Could not save that colour', 'danger'); });
 });
 
 // --- live previews ----------------------------------------------------------
@@ -335,10 +215,10 @@ document.getElementById('thinBorder').addEventListener('change', function () {
     var thin = this.checked;
     document.getElementById('localTime').style.borderWidth = thin ? '3px' : '6px';
     document.getElementById('utcTime').style.borderWidth = thin ? '3px' : '6px';
-    fetch('/setcolor', {
+    fetch('/setdoubleframe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: 'doubleFrame', value: thin })
+        body: JSON.stringify({ value: thin })
     }).then(function (r) {
         if (!r.ok) throw new Error();
         toast('Frame updated', 'success');
@@ -404,7 +284,6 @@ function loadConfig() {
     }).catch(function () { toast('Could not read the current settings', 'danger'); });
 }
 
-setColorTarget('localTimeDigits');
 loadConfig();
 </script>
 </body>

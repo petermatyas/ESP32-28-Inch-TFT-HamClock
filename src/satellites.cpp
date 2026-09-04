@@ -30,6 +30,11 @@
 // 1. Configuration and state
 // =============================================================================
 
+// The global colour theme (wip.cpp) - background and the shared chrome roles
+// every page draws with, so this page's look follows whatever style is chosen
+// on the General web page instead of hardcoding TFT_BLACK/TFT_WHITE etc.
+extern uint16_t themeBg, themeFg, themeDim, themeDim2, themeAccent, themeWarn;
+
 static const char *SAT_CONFIG_FILE = "/satellites.json";
 static const double DEG2RAD_L = 0.017453292519943295;
 
@@ -46,6 +51,7 @@ struct SatSlot {
     uint8_t      failures;
     uint32_t     retryAfterUnix;   // backoff after a failed download
     char         status[40];
+    bool         alertEnabled;     // show the cross-page banner before this one rises
 };
 
 struct PassRow {
@@ -68,6 +74,7 @@ static uint8_t g_horizonDays     = 3;
 static uint8_t g_tleRefreshHours = 12;
 static bool    g_useLocalTime    = true;
 static double  g_altitudeM       = 150.0;
+static int     g_alertLeadMin    = 5;   // minutes before AOS the alert window opens
 
 static double  g_latDeg = 0.0, g_lonDeg = 0.0;
 
@@ -171,9 +178,14 @@ static void saveConfig()
     doc["tleRefreshHours"] = g_tleRefreshHours;
     doc["useLocalTime"]    = g_useLocalTime;
     doc["altitudeM"]       = g_altitudeM;
+    doc["alertLeadMin"]    = g_alertLeadMin;
 
     JsonArray arr = doc["sats"].to<JsonArray>();
-    for (uint8_t i = 0; i < g_slotCount; i++) arr.add(g_slots[i].norad);
+    for (uint8_t i = 0; i < g_slotCount; i++) {
+        JsonObject o = arr.add<JsonObject>();
+        o["norad"] = g_slots[i].norad;
+        o["alert"] = g_slots[i].alertEnabled;
+    }
 
     fs::File f = SPIFFS.open(SAT_CONFIG_FILE, "w");
     if (!f) {
@@ -206,22 +218,28 @@ static void loadConfig()
     g_tleRefreshHours = doc["tleRefreshHours"] | g_tleRefreshHours;
     g_useLocalTime    = doc["useLocalTime"]    | g_useLocalTime;
     g_altitudeM       = doc["altitudeM"]       | g_altitudeM;
+    g_alertLeadMin    = doc["alertLeadMin"]    | g_alertLeadMin;
 
     if (g_horizonDays < 1) g_horizonDays = 1;
     if (g_horizonDays > 5) g_horizonDays = 5;
     if (g_tleRefreshHours < 1) g_tleRefreshHours = 1;
     if (g_minElevation < 0.0)  g_minElevation = 0.0;
     if (g_minElevation > 60.0) g_minElevation = 60.0;
+    if (g_alertLeadMin < 1)  g_alertLeadMin = 1;
+    if (g_alertLeadMin > 15) g_alertLeadMin = 15;
 
     g_slotCount = 0;
     JsonArray arr = doc["sats"].as<JsonArray>();
     for (JsonVariant v : arr) {
         if (g_slotCount >= SAT_MAX_SATS) break;
-        uint32_t id = v.as<uint32_t>();
+        uint32_t id; bool alert = false;
+        if (v.is<JsonObject>()) { id = v["norad"] | 0; alert = v["alert"] | false; }
+        else                    { id = v.as<uint32_t>(); }
         if (id == 0) continue;
         SatSlot &s = g_slots[g_slotCount];
         memset(&s, 0, sizeof(s));
         s.norad = id;
+        s.alertEnabled = alert;
         snprintf(s.name, sizeof(s.name), "%lu", (unsigned long)id);
         snprintf(s.status, sizeof(s.status), "no TLE yet");
         loadTleCache(s);
@@ -470,6 +488,7 @@ static void buildConfigJson(String &out)
     doc["predictedAt"]     = g_predictedAtUnix;
     doc["busy"]            = g_predictBusy;
     doc["maxSats"]         = SAT_MAX_SATS;
+    doc["alertLeadMin"]    = g_alertLeadMin;
 
     JsonArray arr = doc["sats"].to<JsonArray>();
     for (uint8_t i = 0; i < g_slotCount; i++) {
@@ -483,6 +502,7 @@ static void buildConfigJson(String &out)
         o["tleAgeH"] = (s.fetchedUnix && g_nowUnix > (time_t)s.fetchedUnix)
                            ? ((double)(g_nowUnix - (time_t)s.fetchedUnix) / 3600.0)
                            : -1.0;
+        o["alert"] = s.alertEnabled;
     }
     SAT_UNLOCK();
 
@@ -516,18 +536,23 @@ static void handleSaveSatellites(WebServer &server)
     g_tleRefreshHours = doc["tleRefreshHours"] | g_tleRefreshHours;
     g_useLocalTime    = doc["useLocalTime"]    | g_useLocalTime;
     g_altitudeM       = doc["altitudeM"]       | g_altitudeM;
+    g_alertLeadMin    = doc["alertLeadMin"]    | g_alertLeadMin;
 
     if (g_horizonDays < 1) g_horizonDays = 1;
     if (g_horizonDays > 5) g_horizonDays = 5;
     if (g_tleRefreshHours < 1) g_tleRefreshHours = 1;
     if (g_minElevation < 0.0)  g_minElevation = 0.0;
     if (g_minElevation > 60.0) g_minElevation = 60.0;
+    if (g_alertLeadMin < 1)  g_alertLeadMin = 1;
+    if (g_alertLeadMin > 15) g_alertLeadMin = 15;
 
     g_slotCount = 0;
     JsonArray arr = doc["sats"].as<JsonArray>();
     for (JsonVariant v : arr) {
         if (g_slotCount >= SAT_MAX_SATS) break;
-        uint32_t id = v.as<uint32_t>();
+        uint32_t id; bool alertWanted = false;
+        if (v.is<JsonObject>()) { id = v["norad"] | 0; alertWanted = v["alert"] | false; }
+        else                    { id = v.as<uint32_t>(); }
         if (id == 0) continue;
 
         bool duplicate = false;
@@ -544,6 +569,9 @@ static void handleSaveSatellites(WebServer &server)
         for (uint8_t k = 0; k < oldCount; k++) {
             if (old[k].norad == id) { memcpy(&s, &old[k], sizeof(SatSlot)); break; }
         }
+        // Always take the alert flag from this request - the memcpy above
+        // would otherwise silently restore whatever it was before this save.
+        s.alertEnabled = alertWanted;
         g_slotCount++;
     }
 
@@ -696,6 +724,41 @@ static uint8_t computeLive(time_t now, SatLive *out, uint8_t maxOut)
     return n;
 }
 
+// Soonest alert-enabled pass whose AOS is inside the lead window right now.
+// g_passes is already AOS-ascending (see the insertion sort in
+// runPrediction()), so this can stop as soon as a row is further out than the
+// window - nothing later in the list can qualify either.
+static uint32_t g_lastAlertedNorad = 0;
+static double   g_lastAlertedAos   = 0.0;
+
+bool satellitesCheckAlert(time_t utcNow, char *outName, size_t nameLen,
+                           long *outSecsToAos, bool *outIsNewTrigger)
+{
+    bool found = false;
+    *outIsNewTrigger = false;
+
+    SAT_LOCK();
+    for (uint8_t i = 0; i < g_passCount; i++) {
+        double secs = g_passes[i].p.aosUnix - (double)utcNow;
+        if (secs > g_alertLeadMin * 60.0) break;   // sorted - nothing further qualifies
+        if (secs <= 0.0) continue;                  // already risen
+        const SatSlot &s = g_slots[g_passes[i].slot];
+        if (!s.alertEnabled) continue;
+
+        strlcpy(outName, s.name, nameLen);
+        *outSecsToAos = (long)secs;
+        found = true;
+        if (s.norad != g_lastAlertedNorad || g_passes[i].p.aosUnix != g_lastAlertedAos) {
+            *outIsNewTrigger = true;
+            g_lastAlertedNorad = s.norad;
+            g_lastAlertedAos   = g_passes[i].p.aosUnix;
+        }
+        break;
+    }
+    SAT_UNLOCK();
+    return found;
+}
+
 // =============================================================================
 // 7. TFT page rendering
 // =============================================================================
@@ -799,7 +862,7 @@ static void tleHealth(time_t utc, char *out, size_t n, uint16_t *colour)
     }
     SAT_UNLOCK();
 
-    *colour = TFT_DARKGREY;
+    *colour = themeDim;
     char tmp[12];
     if (bad) {
         // The bottom status line is gone, so the warning lives here now.
@@ -825,9 +888,9 @@ static void drawPageHeader(TFT_eSPI &tft)
 {
     tft.setTextDatum(TL_DATUM);
     tft.setFreeFont(&Orbitron_Medium8pt7b);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextColor(themeAccent, themeBg);
     tft.drawString("SATELLITES", COL_NAME, HDR_Y);
-    tft.drawFastHLine(4, RULE1_Y, 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, RULE1_Y, 312, themeDim);
 }
 
 static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
@@ -841,7 +904,7 @@ static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
              tm_.tm_hour, tm_.tm_min, tm_.tm_sec, g_useLocalTime ? "LOC" : "UTC");
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(buf, 314, HDR_Y + 2);
     tft.setTextDatum(TL_DATUM);
@@ -849,14 +912,14 @@ static void drawHeaderClock(TFT_eSPI &tft, time_t utc, int tOffsetHours)
     char tle[12];
     uint16_t tleColour;
     tleHealth(utc, tle, sizeof(tle), &tleColour);
-    tft.setTextColor(tleColour, TFT_BLACK);
+    tft.setTextColor(tleColour, themeBg);
     tft.drawString(tle, 146, HDR_Y + 2);
 }
 
 static void drawBannerFrame(TFT_eSPI &tft, uint8_t lines, bool anyLive)
 {
     tft.drawRoundRect(2, BANNER_Y, 316, bannerHeight(lines), 6,
-                      anyLive ? TFT_GREEN : TFT_DARKGREY);
+                      anyLive ? TFT_GREEN : themeDim);
 }
 
 // One line per satellite that is workable right now.
@@ -888,7 +951,7 @@ static void drawBannerLines(TFT_eSPI &tft, const SatLive *live, uint8_t n, time_
             snprintf(line, sizeof(line), "NO PASS IN PROGRESS");
         }
         padTo(line, 38, sizeof(line));
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         tft.drawString(line, BCOL_NAME, BANNER_Y + 5);
         return;
     }
@@ -916,7 +979,7 @@ static void drawBannerLines(TFT_eSPI &tft, const SatLive *live, uint8_t n, time_
         }
 
         int y = BANNER_Y + 5 + i * BANNER_LINE_H;
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setTextColor(TFT_GREEN, themeBg);
         tft.drawString(name, BCOL_NAME, y);
         tft.drawString(el,   BCOL_EL,   y);
         tft.drawString(az,   BCOL_AZ,   y);
@@ -928,7 +991,7 @@ static void drawTableFurniture(TFT_eSPI &tft, uint8_t lines)
 {
     tft.setTextDatum(TL_DATUM);
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(themeDim, themeBg);
 
     int y = colHdrY(lines);
     tft.drawString("SAT", COL_NAME, y);
@@ -937,14 +1000,14 @@ static void drawTableFurniture(TFT_eSPI &tft, uint8_t lines)
     tft.drawString("DUR", COL_DUR,  y);
     tft.drawString("AZ",  COL_AZ,   y);
 
-    tft.drawFastHLine(4, rule2Y(lines), 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, rule2Y(lines), 312, themeDim);
 }
 
 // One line of the pass list.  Used both for the table and for the bottom row.
 static void drawPassRow(TFT_eSPI &tft, int y, const char *satName,
                         const sgp4::Pass &p, time_t utc, int tOffsetHours)
 {
-    uint16_t colour = (p.aosUnix - (double)utc < 600.0) ? TFT_YELLOW : TFT_LIGHTGREY;
+    uint16_t colour = (p.aosUnix - (double)utc < 600.0) ? themeWarn : themeDim2;
 
     char name[14];
     strlcpy(name, satName, sizeof(name));
@@ -964,7 +1027,7 @@ static void drawPassRow(TFT_eSPI &tft, int y, const char *satName,
 
     tft.setTextDatum(TL_DATUM);
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
-    tft.setTextColor(colour, TFT_BLACK);
+    tft.setTextColor(colour, themeBg);
     tft.drawString(name, COL_NAME, y);
     tft.drawString(aos,  COL_AOS,  y);
     tft.drawString(el,   COL_EL,   y);
@@ -987,7 +1050,7 @@ static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours,
     const uint8_t capacity = tableCapacity(lines);
 
     if (clearFirst)
-        tft.fillRect(0, rule2Y(lines) + 1, 320, 240 - rule2Y(lines) - 1, TFT_BLACK);
+        tft.fillRect(0, rule2Y(lines) + 1, 320, 240 - rule2Y(lines) - 1, themeBg);
 
     PassRow rows[SAT_LIST_MAX];
     char    names[SAT_LIST_MAX][14];
@@ -1008,7 +1071,7 @@ static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours,
     for (uint8_t i = 0; i < capacity; i++) {
         int y = first + i * ROW_H;
         if (i >= shown) {
-            tft.fillRect(0, y - 2, 320, ROW_H, TFT_BLACK);
+            tft.fillRect(0, y - 2, 320, ROW_H, themeBg);
             continue;
         }
         drawPassRow(tft, y, names[i], rows[i].p, utc, tOffsetHours);
@@ -1016,7 +1079,7 @@ static void drawTable(TFT_eSPI &tft, time_t utc, int tOffsetHours,
 
     if (shown == 0) {
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         tft.drawString(configured == 0 ? "No satellites configured."
                                        : "No further passes predicted.",
                        COL_NAME, first);
@@ -1045,12 +1108,12 @@ void satellitesDrawPage(TFT_eSPI &tft, time_t utcNow, int tOffsetHours, bool ful
     bool relayout = fullRedraw || (lines != lastLines);
 
     if (fullRedraw) {
-        tft.fillScreen(TFT_BLACK);
+        tft.fillScreen(themeBg);
         drawPageHeader(tft);
     }
 
     if (relayout) {
-        tft.fillRect(0, BANNER_Y, 320, 240 - BANNER_Y, TFT_BLACK);
+        tft.fillRect(0, BANNER_Y, 320, 240 - BANNER_Y, themeBg);
         drawBannerFrame(tft, lines, nLive > 0);
         drawTableFurniture(tft, lines);
         lastLines   = lines;

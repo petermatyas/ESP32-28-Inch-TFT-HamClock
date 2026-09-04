@@ -3,6 +3,6 @@
   "host": "hrd.wa9pie.net",
   "port": 8000,
   "bandMask": 4095,
-  "modeMask": 7,
-  "euOnly": false
+  "modeMask": 15,
+  "euOnly": true
 }

@@ -7,18 +7,17 @@ It shows **local and UTC time**, **HF/VHF band conditions**, **solar/geomagnetic
 
 ## ✨ Features
 - 📺 **TFT Display** — ILI9341 / ILI9488 via **TFT_eSPI** (fast sprites, broad controller support).  
-- ⏰ **Dual clocks** — Local time + UTC.  
+- ⏰ **Four clock faces on one page** — Dual QTH+UTC, seven segment, analogue dial, or binary (BCD), switchable on the Clock page.  
 - 🌤️ **Weather** — [Open-Meteo](https://open-meteo.com); no account or API key needed.  
 - 🌦️ **Weather page** — Dedicated display page with temperature, daily range, wind, pressure, sunrise/sunset.
 - ☀️ **Solar & HF propagation** — Data from [hamqsl.com](https://www.hamqsl.com/).  
 - 📡 **Band condition indicators** — Good / Fair / Poor at a glance.  
 - 📶 **Easy Wi-Fi setup** — Captive portal AP **`HB9IIUSetup`** on first boot.  
-- 🌐 **Web interface** — One page per screen: General (position, callsign, brightness, splash logo, screensaver), Clock, Big Clock, Weather, Satellites, DX Cluster, WiFi.  
+- 🌐 **Web interface** — One page per screen: General (position, callsign, brightness, splash logo, screensaver), Clock, Weather, Satellites, DX Cluster, WiFi.  
 - 🛰️ **Satellite passes** — Track satellites by NORAD id; next passes plus a live "above the horizon now" indicator.
 - ☀️ **Sun & moon** — Positions, rise and set, moon phase and illumination, grey-line indicator. Computed on the device, no network needed.
 - 📻 **NCDXF/IARU beacons** — Which beacon is transmitting on each band right now, with frequencies. Also purely computed.
 - 🌍 **DX cluster** — Live spots from a telnet cluster node, filtered by band, mode and continent (Europe) from the screen or the web UI.
-- 🕰️ **Three clock faces** — Seven segment, analogue dial, or binary (BCD), switchable on the Big Clock page.
 - 🔆 **Brightness control** — Backlight dimming from the General page.
 - 💤 **Screensaver mode** — Random pixel animation.  
 - 💾 **Persistent settings** — Stored as JSON in SPIFFS.  
@@ -45,14 +44,14 @@ It shows **local and UTC time**, **HF/VHF band conditions**, **solar/geomagnetic
 1. **Power on** the device. It starts an AP called **`HB9IIUSetup`**.  
 2. **Connect** to the AP and open `192.168.4.1` to enter your Wi-Fi credentials.  
 3. After joining your network, access **`http://hamclock.local`**.  
-4. In the web UI, set your **position and callsign** on the General page, pick colors and the clock faces on the Clock/Big Clock pages, and (optionally) **upload a custom splash** image. Weather needs no key.  
+4. In the web UI, set your **position and callsign** on the General page, pick a clock face and its colors on the Clock page, and (optionally) **upload a custom splash** image. Weather needs no key.  
 5. Done — the clock/propagation panels will update automatically.  
 
 ---
 
 ## 🛰️ Satellite Passes
 
-A dedicated display page (touch through to page 8) lists the next passes over your
+A dedicated display page (touch through to page 7) lists the next passes over your
 configured location and highlights any satellite that is above the horizon right now.
 
 1. Open **`http://hamclock.local/sat.html`** (also linked from the navigation bar on every settings page).
@@ -80,21 +79,23 @@ Every frame below is read straight off the panel through the device's own
 not mock-ups. Pages are reached by tapping the right half of the screen to go
 forward and the left half to go back.
 
-### Clocks
+### Clock
 
 <table>
 <tr>
-<td align="center" width="33%"><img src="doc/Screens/01-dual-clock.png" width="300" alt="Page 1 - local and UTC time, with the Maidenhead locator on the QTH caption"><br><sub>Page 1 - local and UTC time, with the Maidenhead locator on the QTH caption</sub></td>
-<td align="center" width="33%"><img src="doc/Screens/07a-bigclock-seven-segment.png" width="300" alt="Page 7 - full screen clock, seven segment"><br><sub>Page 7 - full screen clock, seven segment</sub></td>
-<td align="center" width="33%"><img src="doc/Screens/07b-bigclock-analog.png" width="300" alt="Page 7 - the same clock as an analogue dial"><br><sub>Page 7 - the same clock as an analogue dial</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/01a-clock-dual.png" width="300" alt="Page 1 - local and UTC time together, with the Maidenhead locator on the QTH caption"><br><sub>Page 1 - local and UTC time together, with the Maidenhead locator on the QTH caption</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/01b-clock-seven-segment.png" width="300" alt="Page 1 - full screen clock, seven segment"><br><sub>Page 1 - full screen clock, seven segment</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/01c-clock-analog.png" width="300" alt="Page 1 - the same clock as an analogue dial"><br><sub>Page 1 - the same clock as an analogue dial</sub></td>
 </tr>
 <tr>
-<td align="center" width="33%"><img src="doc/Screens/07c-bigclock-binary.png" width="300" alt="Page 7 - and as a binary (BCD) clock"><br><sub>Page 7 - and as a binary (BCD) clock</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/01d-clock-binary.png" width="300" alt="Page 1 - and as a binary (BCD) clock"><br><sub>Page 1 - and as a binary (BCD) clock</sub></td>
 <td colspan="2" valign="top">
 
-The full-screen clock has three faces, chosen on the <b>Big Clock</b> page of the
-web UI. Whichever is showing, the badge underneath switches the clock between
-<b>QTH</b> and <b>UTC</b> time when tapped.
+Page 1 has four faces, chosen on the <b>Clock</b> page of the web UI: the dual
+QTH+UTC display, or one of three full-screen single-time clocks. On the three
+single-time faces, the badge underneath switches the clock between <b>QTH</b>
+and <b>UTC</b> time when tapped; the dual face already shows both, so it has no
+badge.
 
 The binary clock reads bottom-up, one column per decimal digit, hours through
 seconds; the bit weights run down the left edge and the decimal value is printed
@@ -114,8 +115,8 @@ under each column.
 </tr>
 <tr>
 <td align="center" width="33%"><img src="doc/Screens/05-solar-3.png" width="300" alt="Page 5 - aurora and sporadic-E openings"><br><sub>Page 5 - aurora and sporadic-E openings</sub></td>
-<td align="center" width="33%"><img src="doc/Screens/10-beacons.png" width="300" alt="Page 10 - NCDXF/IARU beacon tracker, computed from the clock alone"><br><sub>Page 10 - NCDXF/IARU beacon tracker, computed from the clock alone</sub></td>
-<td align="center" width="33%"><img src="doc/Screens/12-dx-cluster.png" width="300" alt="Page 12 - live DX cluster spots, filtered by band, mode and continent"><br><sub>Page 12 - live DX cluster spots, filtered by band, mode and continent</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/09-beacons.png" width="300" alt="Page 9 - NCDXF/IARU beacon tracker, computed from the clock alone"><br><sub>Page 9 - NCDXF/IARU beacon tracker, computed from the clock alone</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/11-dx-cluster.png" width="300" alt="Page 11 - live DX cluster spots, filtered by band, mode and continent"><br><sub>Page 11 - live DX cluster spots, filtered by band, mode and continent</sub></td>
 </tr>
 </table>
 
@@ -128,9 +129,9 @@ touch panel of band, mode and continent chips.
 
 <table>
 <tr>
-<td align="center" width="33%"><img src="doc/Screens/11-sun-moon.png" width="300" alt="Page 11 - sun and moon positions, rise and set, phase and grey line"><br><sub>Page 11 - sun and moon positions, rise and set, phase and grey line</sub></td>
-<td align="center" width="33%"><img src="doc/Screens/08-satellites.png" width="300" alt="Page 8 - upcoming satellite passes for the configured QTH"><br><sub>Page 8 - upcoming satellite passes for the configured QTH</sub></td>
-<td align="center" width="33%"><img src="doc/Screens/09-weather.png" width="300" alt="Page 9 - current conditions from Open-Meteo"><br><sub>Page 9 - current conditions from Open-Meteo</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/10-sun-moon.png" width="300" alt="Page 10 - sun and moon positions, rise and set, phase and grey line"><br><sub>Page 10 - sun and moon positions, rise and set, phase and grey line</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/07-satellites.png" width="300" alt="Page 7 - upcoming satellite passes for the configured QTH"><br><sub>Page 7 - upcoming satellite passes for the configured QTH</sub></td>
+<td align="center" width="33%"><img src="doc/Screens/08-weather.png" width="300" alt="Page 8 - current conditions from Open-Meteo"><br><sub>Page 8 - current conditions from Open-Meteo</sub></td>
 </tr>
 <tr>
 <td align="center" width="33%"><img src="doc/Screens/06-wifi.png" width="300" alt="Page 6 - Wi-Fi link quality, addresses and NTP state"><br><sub>Page 6 - Wi-Fi link quality, addresses and NTP state</sub></td>

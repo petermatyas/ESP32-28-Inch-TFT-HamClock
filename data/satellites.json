@@ -4,11 +4,15 @@
   "tleRefreshHours": 12,
   "useLocalTime": true,
   "altitudeM": 150,
+  "alertLeadMin": 5,
   "sats": [
-    25544,
-    43678,
-    40908,
-    43017,
-    57166
+    {
+      "norad": 25544,
+      "alert": false
+    },
+    {
+      "norad": 67290,
+      "alert": false
+    }
   ]
 }

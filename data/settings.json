@@ -1,12 +1,8 @@
 {
   "latitude": 47.2297,
   "longitude": 16.6186,
-  "localTimeColour": 2016,
-  "utcTimeColour": 63554,
   "doubleFrame": false,
-  "localFrameColour": 31727,
-  "utcFrameColour": 13120,
-  "bannerColour": 21604,
+  "colourTheme": 0,
   "bannerSpeed": 11,
   "localTimeLabel": "  QTH Time  ",
   "utcTimeLabel": "  UTC Time  ",
@@ -14,10 +10,9 @@
   "italicClockFonts": false,
   "autoPageChange": false,
   "useScreenSaver": true,
-  "bigClockColour": 11877,
-  "screenSaverTimeout": 120000,
-  "bigClockShowsUtc": true,
-  "bigClockStyle": 0,
+  "bigClockShowsUtc": false,
+  "bigClockStyle": 3,
   "weatherIntervalMin": 30,
+  "screenSaverTimeout": 5880000,
   "brightness": 100
 }

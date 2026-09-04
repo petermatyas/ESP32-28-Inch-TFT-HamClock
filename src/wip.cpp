@@ -156,6 +156,66 @@ uint16_t bigClockColour = TFT_GREEN;
 int brightness = 100;   // backlight, percent - see applyBrightness()
 static const int BACKLIGHT_LEDC_CHANNEL = 0;
 
+// One global colour style for every page.  Two dark, two light - light
+// themes actually paint a light background, not just brighter text on black.
+enum ColourTheme : uint8_t
+{
+    THEME_DARK_CLASSIC = 0,   // today's look: black background, white/cyan chrome
+    THEME_DARK_AMBER = 1,     // black background, warm amber/gold chrome
+    THEME_LIGHT_CLASSIC = 2,  // white background, black/navy chrome
+    THEME_LIGHT_WARM = 3,     // cream background, maroon/olive chrome
+    THEME_COUNT
+};
+uint8_t colourTheme = THEME_DARK_CLASSIC;
+
+// Chrome roles shared by every page's drawing code, computed by
+// applyColourTheme() from THEME_PALETTES below.  bg is the page background
+// (and doubles as the "erase" colour for every partial/ticking redraw); fg is
+// default body text; dim/dim2 are the two shades used for borders, rules and
+// secondary text; accent is headers and the locator; warn is used for "fair"
+// / imminent / attention colouring.  Green/red/orange status colours (band
+// conditions, TLE health, temperature scale) are intentionally left as literal
+// constants in the drawing code - they carry meaning independent of style.
+uint16_t themeBg, themeFg, themeDim, themeDim2, themeAccent, themeWarn;
+
+struct ThemePalette
+{
+    uint16_t bg, fg, dim, dim2, accent, warn;
+    uint16_t localTimeColour, utcTimeColour, localFrameColour, utcFrameColour, bannerColour, bigClockColour;
+};
+
+static const ThemePalette THEME_PALETTES[THEME_COUNT] = {
+    // DARK_CLASSIC - identical to the previously-hardcoded look
+    {TFT_BLACK, TFT_WHITE, TFT_DARKGREY, TFT_LIGHTGREY, TFT_CYAN, TFT_YELLOW,
+     TFT_GREEN, TFT_GOLD, TFT_DARKGREY, TFT_DARKGREY, TFT_DARKGREEN, TFT_GREEN},
+    // DARK_AMBER - warm monochrome terminal look, still a black background
+    {TFT_BLACK, TFT_GOLD, TFT_SILVER, TFT_ORANGE, TFT_ORANGE, TFT_YELLOW,
+     TFT_GOLD, TFT_ORANGE, TFT_SILVER, TFT_SILVER, TFT_ORANGE, TFT_GOLD},
+    // LIGHT_CLASSIC - white background, black text, navy accents
+    {TFT_WHITE, TFT_BLACK, TFT_DARKGREY, 0x4A69, TFT_NAVY, TFT_ORANGE,
+     TFT_DARKGREEN, TFT_NAVY, TFT_DARKGREY, TFT_DARKGREY, TFT_NAVY, TFT_DARKGREEN},
+    // LIGHT_WARM - cream background, maroon/olive accents
+    {0xFFDE, TFT_BLACK, 0x6B4D, 0x8410, TFT_MAROON, TFT_RED,
+     TFT_OLIVE, TFT_MAROON, 0x6B4D, 0x6B4D, TFT_MAROON, TFT_OLIVE},
+};
+
+void applyColourTheme()
+{
+    const ThemePalette &p = THEME_PALETTES[colourTheme];
+    themeBg = p.bg;
+    themeFg = p.fg;
+    themeDim = p.dim;
+    themeDim2 = p.dim2;
+    themeAccent = p.accent;
+    themeWarn = p.warn;
+    localTimeColour = p.localTimeColour;
+    utcTimeColour = p.utcTimeColour;
+    localFrameColour = p.localFrameColour;
+    utcFrameColour = p.utcFrameColour;
+    bannerColour = p.bannerColour;
+    bigClockColour = p.bigClockColour;
+}
+
 // Page 1 (dual clock) frame geometry.  No page header here - the page is
 // nothing but the two clocks, so the full screen height goes to them instead.
 static const int FRAME_TOP1 = 0, FRAME_H = 87;                   // 0..87
@@ -193,8 +253,6 @@ String formatUpdatedTimestampToUTC(const String &raw);
 String LOCALlastTimeStr = "        "; // 8 characters: HH:MM:SS
 String UTClastTimeStr = "        ";   // 8 characters: HH:MM:SS
 String LASTbigClockTimeStr = "";
-uint16_t LOCALdigitColor = TFT_LIGHTGREY;
-uint16_t UTCdigitColor = TFT_LIGHTGREY;
 bool blinkingDot = false; // colons on Propagation page clocks
 bool colonVisible = true; // global var used to show/hide colons on Propagation page clocks
 bool redrawMainPropagationPage = true;
@@ -329,9 +387,11 @@ void fetchWeatherData();
 String formatLocalTime(long epochTime);
 String convertEpochToTimeString(long epochTime);
 void displayTime(int x, int y, String time, String &previousTime, int yOffset, uint16_t fontColor);
-String convertTimestampToDate(long timestamp);
 void loadSettings();
 void applyBrightness();
+void startBacklightAlertPulse();
+void serviceBacklightAlertPulse(unsigned long now);
+void drawSatelliteAlertBanner(const char *name, long secsToAos, bool fullRepaint);
 void handleRoot();
 void handleSave();
 void drawOrredrawStaticElements();
@@ -590,6 +650,7 @@ doc ["bigClockShowsUtc"] = bigClockShowsUtc;
 doc ["bigClockStyle"] = bigClockStyle;
 doc ["bigClockColour"] = bigClockColour;
 doc ["brightness"] = brightness;
+doc ["colourTheme"] = colourTheme;
 
   String response;
   serializeJson(doc, response);
@@ -598,63 +659,43 @@ doc ["brightness"] = brightness;
             server.on("/scrolltext", []()
                       { server.send(200, "text/plain", scrollText); });
 
-            server.on("/setcolor", HTTP_POST, []()
+            server.on("/setdoubleframe", HTTP_POST, []()
                       {
-
-
-   JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
-    if (error) {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
         server.send(400, "text/plain", "JSON parse error");
         return;
     }
-
-    String target = doc["target"];
-
-    // ✅ Handle doubleFrame checkbox
-    if (target == "doubleFrame") {
-        bool thinBorder = doc["value"];
-        doubleFrame = !thinBorder; // Inverse logic
-        Serial.printf("🪟 doubleFrame set to: %s (thinBorder: %s)\n", doubleFrame ? "true" : "false", thinBorder ? "true" : "false");
-        server.send(200, "text/plain", "OK");
-        return;
-    }
-
-    // ✅ All other color-based updates
-    uint16_t color = doc["color"];
-
-    if (target == "localTimeDigits") {
-        localTimeColour = color;
-        Serial.printf("🎨 localTimeDigits set to: 0x%04X\n", color);
-    } else if (target == "localTimeFrame") {
-        localFrameColour = color;
-        Serial.printf("🖼️ localTimeFrame set to: 0x%04X\n", color);
-    } else if (target == "utcTimeDigits") {
-        utcTimeColour = color;
-        Serial.printf("🎨 utcTimeDigits set to: 0x%04X\n", color);
-    } else if (target == "utcTimeFrame") {
-        utcFrameColour = color;
-        Serial.printf("🖼️ utcTimeFrame set to: 0x%04X\n", color);
-    } else if (target == "weatherBannerText") {
-        bannerColour = color;
-        Serial.printf("🟩 bannerColour set to: 0x%04X\n", color);
-    }      else if (target == "bigClockTime") {
-        bigClockColour = color;
-        LASTbigClockTimeStr="";
-for (int i = 0; i < 4; i++) {
-    bigClockLastDigit[i] = ' '; 
-}        Serial.printf("🟩 big clock color set to: 0x%04X\n", color); }
-    
-    else {
-        Serial.printf("⚠️ Unknown target: %s\n", target.c_str());
-        server.send(400, "text/plain", "Unknown target");
-        return;
-    }
+    bool thinBorder = doc["value"];
+    doubleFrame = !thinBorder; // Inverse logic
+    Serial.printf("🪟 doubleFrame set to: %s (thinBorder: %s)\n", doubleFrame ? "true" : "false", thinBorder ? "true" : "false");
     saveSettings();
     if (activePage==1 && bigClockStyle == BIGCLOCK_DUAL){
     drawOrredrawStaticElements();
     }
-    refreshDigits = true;
+    server.send(200, "text/plain", "OK"); });
+
+            server.on("/settheme", HTTP_POST, []()
+                      {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "text/plain", "JSON parse error");
+        return;
+    }
+    int t = doc["theme"] | -1;
+    if (t < 0 || t >= THEME_COUNT) {
+        server.send(400, "text/plain", "Invalid theme");
+        return;
+    }
+    colourTheme = (uint8_t)t;
+    applyColourTheme();
+    saveSettings();
+    Serial.printf("\U0001F3A8 colourTheme set to: %d\n", colourTheme);
+    LASTbigClockTimeStr = "";
+    for (int i = 0; i < 4; i++) {
+        bigClockLastDigit[i] = ' ';
+    }
+    activatePage(activePage); // clean full repaint of whatever page is on screen
     server.send(200, "text/plain", "OK"); });
 
             server.on("/setspeed", HTTP_POST, []()
@@ -777,7 +818,7 @@ for (int i = 0; i < 4; i++) {
     // Only repaint when that page is the one on screen; the redraw clears the
     // whole display and would wipe whatever else is showing.
     if (activePage == 1) {
-        tft.fillScreen(TFT_BLACK);
+        tft.fillScreen(themeBg);
         if (bigClockStyle == BIGCLOCK_DUAL) {
             drawOrredrawStaticElements();
         } else {
@@ -974,9 +1015,21 @@ void loop()
     static unsigned long lastDotUpdate = 0;
     static bool screenSaver = false;
 
+    static bool alertBannerShowing = false;
+
     // 🛰️ Keeps the element sets fresh and hands the current time to the
     // prediction task.  Rate-limits itself, so calling it every pass is fine.
     satellitesLoop((time_t)timeClient.getEpochTime());
+
+    // Cross-page satellite alert: checked once per tick regardless of which
+    // page is active, so the banner/pulse below can fire no matter what's on
+    // screen.  See satellitesCheckAlert() for the AOS-window scan itself.
+    char alertName[26];
+    long alertSecs = 0;
+    bool alertIsNew = false;
+    bool alertActive = satellitesCheckAlert((time_t)timeClient.getEpochTime(),
+                                             alertName, sizeof(alertName),
+                                             &alertSecs, &alertIsNew);
 
     // A heap that only ever shrinks points at a leak; a largest-block that
     // shrinks faster than the total points at fragmentation.  MALLOC_CAP_8BIT
@@ -1066,6 +1119,13 @@ void loop()
             activatePage(1);
             lastActivity = currentMillis; // 🔄 Reset inactivity timer
         }
+        else if (alertActive && alertIsNew)
+        {
+            Serial.println("\U0001F6F0 Satellite alert — exiting screensaver.");
+            screenSaver = false;
+            activatePage(1);
+            lastActivity = currentMillis;
+        }
         return;
     }
     // 📺 Normal Mode
@@ -1098,7 +1158,7 @@ void loop()
                 if (currentMillis - previousMillisForScroller >= bannerSpeed)
                 {
                     previousMillisForScroller = currentMillis;
-                    scrollingText.fillSprite(TFT_BLACK);
+                    scrollingText.fillSprite(themeBg);
                     scrollingText.setTextColor(bannerColour);
                     scrollingText.drawString(scrollText, scrollingTextXposition, 0);
                     scrollingTextXposition -= 1;
@@ -1135,8 +1195,8 @@ void loop()
                 String localTime = formatLocalTime(localEpoch);
                 String utcTime = timeClient.getFormattedTime();
 
-                drawLOCALTime(String(localTime), 30, 205, LOCALdigitColor, TFT_BLACK, blinkingDot);
-                drawUTCTime(String(utcTime), 30 + 160, 205, UTCdigitColor, TFT_BLACK, blinkingDot);
+                drawLOCALTime(String(localTime), 30, 205, themeDim2, themeBg, blinkingDot);
+                drawUTCTime(String(utcTime), 30 + 160, 205, themeDim2, themeBg, blinkingDot);
             }
             break;
 
@@ -1228,6 +1288,21 @@ void loop()
             break;
         }
         }
+
+    // Cross-page satellite alert banner: painted over whatever the switch
+    // above just drew, once per tick, regardless of which page is active.
+    if (alertActive)
+    {
+        if (alertIsNew) startBacklightAlertPulse();
+        drawSatelliteAlertBanner(alertName, alertSecs, !alertBannerShowing);
+        alertBannerShowing = true;
+    }
+    else if (alertBannerShowing)
+    {
+        alertBannerShowing = false;
+        activatePage(activePage);   // hands the page's own header back
+    }
+    serviceBacklightAlertPulse(currentMillis);
 
     if (autoPageChange)
     {
@@ -1452,7 +1527,6 @@ void fetchWeatherData()
                   weather.windGust, weather.tempMin, weather.tempMax);
 
     scrollText = String(weather.city) + "     " + weather.country + "    " +
-                 convertTimestampToDate(weather.fetchedUnix) + "     " +
                  "Tmp: " + String(weather.temp, 1) + " C     " +
                  "RH: " + String(weather.humidity) + "%" + "       " +
                  "Pres: " + String(weather.pressure) + "hPa" + "       " +
@@ -1512,7 +1586,7 @@ void displayTime(int x, int y, String time, String &previousTime, int yOffset, u
     {
         if (time[i] != previousTime[i])
         {
-            tft.setTextColor(TFT_BLACK);
+            tft.setTextColor(themeBg);
             tft.drawString(String(previousTime[i]), positions[i], y + yOffset, 1);
             tft.setTextColor(fontColor);
             tft.drawString(String(time[i]), positions[i], y + yOffset, 1);
@@ -1576,15 +1650,6 @@ void displayPNGfromSPIFFS(const char *filename, int duration_ms)
     delay(duration_ms);
 }
 
-String convertTimestampToDate(long timestamp)
-{
-    struct tm *timeinfo;
-    timeinfo = localtime(&timestamp);                       // Convert epoch to local time
-    char buffer[11];                                        // Buffer for "DD:MM:YY"
-    strftime(buffer, sizeof(buffer), "%d:%m:%y", timeinfo); // Format as DD:MM:YY
-    return String(buffer);
-}
-
 void loadSettings()
 {
 
@@ -1610,12 +1675,9 @@ void loadSettings()
 
     latitude = doc["latitude"] | latitude;
     longitude = doc["longitude"] | longitude;
-    localTimeColour = doc["localTimeColour"] | localTimeColour;
-    utcTimeColour = doc["utcTimeColour"] | utcTimeColour;
     doubleFrame = doc["doubleFrame"] | doubleFrame;
-    localFrameColour = doc["localFrameColour"] | localFrameColour;
-    utcFrameColour = doc["utcFrameColour"] | utcFrameColour;
-    bannerColour = doc["bannerColour"] | bannerColour;
+    colourTheme = doc["colourTheme"] | colourTheme;
+    if (colourTheme >= THEME_COUNT) colourTheme = THEME_DARK_CLASSIC;
     bannerSpeed = doc["bannerSpeed"] | bannerSpeed;
     localTimeLabel = doc["localTimeLabel"] | localTimeLabel;
     utcTimeLabel = doc["utcTimeLabel"] | utcTimeLabel;
@@ -1624,7 +1686,6 @@ void loadSettings()
     screenSaverTimeout = doc["screenSaverTimeout"] | screenSaverTimeout;
     autoPageChange = doc["autoPageChange"] | autoPageChange;
     useScreenSaver = doc["useScreenSaver"] | useScreenSaver;
-    bigClockColour = doc["bigClockColour"] | bigClockColour;
     bigClockShowsUtc = doc["bigClockShowsUtc"] | bigClockShowsUtc;
     bigClockStyle = doc["bigClockStyle"] | bigClockStyle;
     if (bigClockStyle >= BIGCLOCK_STYLE_COUNT) bigClockStyle = BIGCLOCK_SEVENSEG;
@@ -1633,6 +1694,8 @@ void loadSettings()
     if (weatherIntervalMin > WEATHER_INTERVAL_MAX_LIMIT) weatherIntervalMin = WEATHER_INTERVAL_MAX_LIMIT;
     brightness = doc["brightness"] | brightness;
     brightness = constrain(brightness, 10, 100);
+
+    applyColourTheme(); // colour fields above are theme-derived, not individually stored
 
     Serial.println();
     Serial.println("-----------------------------------------------------------------");
@@ -1673,17 +1736,48 @@ void applyBrightness()
     ledcWrite(BACKLIGHT_LEDC_CHANNEL, duty);
 }
 
+// Non-blocking backlight pulse used to draw attention to a fresh satellite
+// alert - six steps alternating dim/bright (~1 s), then applyBrightness()
+// restores the persisted level exactly.  The pulse never touches the
+// `brightness` setting itself.
+static bool alertPulseActive = false;
+static uint8_t alertPulseStep = 0;
+static unsigned long alertPulseLastMs = 0;
+
+void startBacklightAlertPulse()
+{
+    alertPulseActive = true;
+    alertPulseStep = 0;
+    alertPulseLastMs = millis();
+}
+
+void serviceBacklightAlertPulse(unsigned long now)
+{
+    if (!alertPulseActive) return;
+    if (now - alertPulseLastMs < 150) return;
+    alertPulseLastMs = now;
+    if (alertPulseStep >= 6)
+    {
+        applyBrightness();
+        alertPulseActive = false;
+        return;
+    }
+    bool dim = (alertPulseStep % 2 == 0);
+#if defined(TFT_BACKLIGHT_ON) && (TFT_BACKLIGHT_ON == HIGH)
+    ledcWrite(BACKLIGHT_LEDC_CHANNEL, dim ? 40 : 255);
+#else
+    ledcWrite(BACKLIGHT_LEDC_CHANNEL, dim ? 215 : 0);
+#endif
+    alertPulseStep++;
+}
+
 void saveSettings()
 {
     JsonDocument doc;
     doc["latitude"] = latitude;
     doc["longitude"] = longitude;
-    doc["localTimeColour"] = localTimeColour;
-    doc["utcTimeColour"] = utcTimeColour;
     doc["doubleFrame"] = doubleFrame;
-    doc["localFrameColour"] = localFrameColour;
-    doc["utcFrameColour"] = utcFrameColour;
-    doc["bannerColour"] = bannerColour;
+    doc["colourTheme"] = colourTheme;
     doc["bannerSpeed"] = bannerSpeed;
     doc["localTimeLabel"] = localTimeLabel;
     doc["utcTimeLabel"] = utcTimeLabel;
@@ -1691,7 +1785,6 @@ void saveSettings()
     doc["italicClockFonts"] = italicClockFonts;
     doc["autoPageChange"] = autoPageChange;
     doc["useScreenSaver"] = useScreenSaver;
-    doc["bigClockColour"] = bigClockColour;
     doc["bigClockShowsUtc"] = bigClockShowsUtc;
     doc["bigClockStyle"] = bigClockStyle;
     doc["weatherIntervalMin"] = weatherIntervalMin;
@@ -1783,7 +1876,7 @@ void handleSave()
 void drawOrredrawStaticElements()
 {
     // Only run if we want to refresh the frames
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
     if (refreshFrames)
     {
         refreshFramesCounter++;
@@ -1797,11 +1890,11 @@ void drawOrredrawStaticElements()
     previousLocalTime = "";
     previousUTCtime = "";
     tft.setFreeFont(&Orbitron_Medium8pt7b);
-    tft.fillRect(25, FRAME_TOP1 + FRAME_H - 10, 270, 20, TFT_BLACK);
-    tft.fillRect(25, FRAME_TOP2 + FRAME_H - 10, 270, 20, TFT_BLACK);
+    tft.fillRect(25, FRAME_TOP1 + FRAME_H - 10, 270, 20, themeBg);
+    tft.fillRect(25, FRAME_TOP2 + FRAME_H - 10, 270, 20, themeBg);
 
     // 🟩 Local Frame
-    tft.fillRect(0, FRAME_TOP1, 320, FRAME_H, TFT_BLACK); // Clear previous frame
+    tft.fillRect(0, FRAME_TOP1, 320, FRAME_H, themeBg); // Clear previous frame
 
     tft.drawRoundRect(1, FRAME_TOP1 + 1, 319, FRAME_H - 2, 5, localFrameColour);
     if (doubleFrame)
@@ -1822,7 +1915,7 @@ void drawOrredrawStaticElements()
     const int LABEL_Y1 = FRAME_TOP1 + FRAME_H - 11;   // same 11 px clearance to the frame's bottom edge as before
     const int LOCATOR_Y1 = LABEL_Y1;                  // shares the caption's baseline - see below
 
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(themeDim, themeBg);
     tft.drawCentreString(localTimeLabel, LABEL_CX, LABEL_Y1, 1);
 
     // The Maidenhead locator belongs to the QTH, so it goes on the caption row
@@ -1846,7 +1939,7 @@ void drawOrredrawStaticElements()
         // clear each other rather than letting them collide.
         if (locRight < labelLeft - 8)
         {
-            tft.setTextColor(TFT_CYAN, TFT_BLACK);
+            tft.setTextColor(themeAccent, themeBg);
             tft.drawString(loc, LOCATOR_LEFT, LOCATOR_Y1);
         }
 
@@ -1854,7 +1947,7 @@ void drawOrredrawStaticElements()
     }
 
     // 🟥 UTC Frame
-    tft.fillRect(0, FRAME_TOP2, 320, FRAME_H, TFT_BLACK); // Clear previous frame
+    tft.fillRect(0, FRAME_TOP2, 320, FRAME_H, themeBg); // Clear previous frame
 
     tft.drawRoundRect(1, FRAME_TOP2, 319, FRAME_H - 2, 5, utcFrameColour);
     if (doubleFrame)
@@ -1982,7 +2075,7 @@ void handlePNGUpload()
 static void activatePage(uint8_t page)
 {
     activePage = page;
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
 
     switch (activePage)
     {
@@ -2074,7 +2167,7 @@ void handleTouchToRotatePage()
                 {
                     bigClockLastDigit[i] = ' ';
                 }
-                tft.fillScreen(TFT_BLACK);
+                tft.fillScreen(themeBg);
                 bigClockColonState = -1;
                 bigClockLabelDirty = true;
                 bigClockFullRedraw = true;
@@ -2112,28 +2205,14 @@ void handleTouchToRotatePage()
 
 void drawMainPropagationPage()
 {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
     drawPageHeader("BAND CONDITIONS");
 
-    // draw frames
-    //  Define positions and dimensions
-    int dayX = 10;
-    int nightX = 170;
-    int blockWidth = 140;
-    int cornerRadius = 8;
-
-    // DAY / NIGHT labels sit above their box now instead of notched into its
-    // border - that notch trick clashed with the header rule at y=19 and isn't
-    // how the newer pages label anything.
+    // No frames around the two columns - just the DAY/NIGHT labels above them.
     tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.drawCentreString("DAY", 80, 21, 1);
     tft.drawCentreString("NIGHT", 240, 21, 1);
-
-    int blockY = 39;
-    int blockHeight = 114;
-    tft.drawRoundRect(dayX, blockY, blockWidth, blockHeight, cornerRadius, TFT_DARKGREY);
-    tft.drawRoundRect(nightX, blockY, blockWidth, blockHeight, cornerRadius, TFT_DARKGREY);
 
     // Band conditions by time
     tft.setFreeFont(&JetBrainsMono_Bold15pt7b);
@@ -2146,40 +2225,32 @@ void drawMainPropagationPage()
 
         String band = solarData.bandConditions[i].name;
         String cond = solarData.bandConditions[i].condition;
-        uint16_t color = cond == "Good" ? TFT_GREEN : cond == "Fair" ? TFT_YELLOW
+        uint16_t color = cond == "Good" ? TFT_GREEN : cond == "Fair" ? themeWarn
                                                                      : TFT_RED;
-        tft.setTextColor(color);
+        tft.setTextColor(color, themeBg);
         tft.drawCentreString(band, 80, yStart + i * rowSpacing, 1);
 
         // NIGHT
         band = solarData.bandConditions[i + 4].name;
         cond = solarData.bandConditions[i + 4].condition;
-        color = cond == "Good" ? TFT_GREEN : cond == "Fair" ? TFT_YELLOW
+        color = cond == "Good" ? TFT_GREEN : cond == "Fair" ? themeWarn
                                                             : TFT_RED;
-        tft.setTextColor(color);
+        tft.setTextColor(color, themeBg);
 
         tft.drawCentreString(band, 240, yStart + i * rowSpacing, 1);
     }
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.drawCentreString("Updated: " + solarData.updated, 160, 160, 1);
 
-    int LocalX = 10;
-    int UTCX = 170;
-
-    // Same "label above a plain box" treatment as DAY/NIGHT.  The clock digits
+    // Same "label above the text" treatment as DAY/NIGHT.  The clock digits
     // (drawLOCALTime()/drawUTCTime() in loop(), fixed at y=205) still land
-    // comfortably inside this box - only its top edge and height changed.
+    // where they always did.
     tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.drawCentreString("Local", 80, 176, 1);
     tft.drawCentreString("UTC", 240, 176, 1);
-
-    blockY = 194;
-    blockHeight = 44;
-    tft.drawRoundRect(LocalX, blockY, blockWidth, blockHeight, cornerRadius, TFT_DARKGREY);
-    tft.drawRoundRect(UTCX, blockY, blockWidth, blockHeight, cornerRadius, TFT_DARKGREY);
 }
 
 // ---------------------------------------------------------------------------
@@ -2486,7 +2557,7 @@ void drawSolarSummaryPage1()
     // the first row's glyphs poke up into the header.
     int y = 32;
     int lineSpacing = 16;
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
     drawPageHeaderWithClock("SOLAR INDICES", true);
 
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
@@ -2499,7 +2570,7 @@ void drawSolarSummaryPage1()
 
     auto printLine = [&](const String &label, const String &value, uint16_t color, const String &comment = "")
     {
-        tft.setTextColor(color, TFT_BLACK); // foreground on black
+        tft.setTextColor(color, themeBg);
         tft.setCursor(labelX, y);
         tft.print(label);
         tft.setCursor(valueX, y);
@@ -2523,7 +2594,7 @@ void drawSolarSummaryPage1()
         if (k >= 4)
             return std::make_pair(TFT_ORANGE, "Unsettled");
         if (k >= 2)
-            return std::make_pair(TFT_YELLOW, "Quiet");
+            return std::make_pair((int)themeWarn, "Quiet");
         return std::make_pair(TFT_GREEN, "Very Quiet");
     };
 
@@ -2534,7 +2605,7 @@ void drawSolarSummaryPage1()
         if (a >= 20)
             return std::make_pair(TFT_ORANGE, "Unsettled");
         if (a >= 10)
-            return std::make_pair(TFT_YELLOW, "Normal");
+            return std::make_pair((int)themeWarn, "Normal");
         return std::make_pair(TFT_GREEN, "Quiet");
     };
 
@@ -2543,7 +2614,7 @@ void drawSolarSummaryPage1()
         if (sfi >= 150)
             return std::make_pair(TFT_GREEN, "Excellent");
         if (sfi >= 100)
-            return std::make_pair(TFT_YELLOW, "Good");
+            return std::make_pair((int)themeWarn, "Good");
         return std::make_pair(TFT_RED, "Poor");
     };
 
@@ -2554,7 +2625,7 @@ void drawSolarSummaryPage1()
         if (x.startsWith("M"))
             return std::make_pair(TFT_ORANGE, "Moderate");
         if (x.startsWith("C"))
-            return std::make_pair(TFT_YELLOW, "Low");
+            return std::make_pair((int)themeWarn, "Low");
         return std::make_pair(TFT_GREEN, "Quiet");
     };
 
@@ -2567,19 +2638,19 @@ void drawSolarSummaryPage1()
     auto [kColor, kComment] = kIndexColorComment(solarData.kIndex);
     printLine("K Index", String(solarData.kIndex), kColor, kComment);
 
-    printLine("K Index NT", solarData.kIndexNT, TFT_WHITE);
+    printLine("K Index NT", solarData.kIndexNT, themeFg);
 
     auto [xrColor, xrComment] = xrayColorComment(solarData.xRay);
     printLine("X-Ray", solarData.xRay, xrColor, xrComment);
 
-    printLine("Sunspots", String(solarData.sunspots), TFT_WHITE);
-    printLine("Helium Line", String(solarData.heliumLine, 1), TFT_WHITE);
-    printLine("Proton Flux", solarData.protonFlux, TFT_WHITE);
-    printLine("Electron Flux", solarData.electronFlux, TFT_WHITE);
-    printLine("Aurora", String(solarData.aurora), TFT_WHITE);
-    printLine("Normalization", String(solarData.normalization, 2), TFT_WHITE);
-    printLine("Lat Degree", String(solarData.latDegree, 2), TFT_WHITE);
-    printLine("Solar Wind", String(solarData.solarWind, 1), TFT_WHITE);
+    printLine("Sunspots", String(solarData.sunspots), themeFg);
+    printLine("Helium Line", String(solarData.heliumLine, 1), themeFg);
+    printLine("Proton Flux", solarData.protonFlux, themeFg);
+    printLine("Electron Flux", solarData.electronFlux, themeFg);
+    printLine("Aurora", String(solarData.aurora), themeFg);
+    printLine("Normalization", String(solarData.normalization, 2), themeFg);
+    printLine("Lat Degree", String(solarData.latDegree, 2), themeFg);
+    printLine("Solar Wind", String(solarData.solarWind, 1), themeFg);
 }
 
 void drawSolarSummaryPage2()
@@ -2588,7 +2659,7 @@ void drawSolarSummaryPage2()
     // has to clear the rule by a full ascent, not just a few pixels.
     int y = 32;
     int lineSpacing = 18;
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
     drawPageHeaderWithClock("GEOMAG / MUF", true);
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     tft.setTextSize(1);
@@ -2597,9 +2668,9 @@ void drawSolarSummaryPage2()
     const int valueX = 120;
     const int commentX = 200;
 
-    auto printLine = [&](const String &label, const String &value, uint16_t color = TFT_WHITE, const String &comment = "")
+    auto printLine = [&](const String &label, const String &value, uint16_t color = themeFg, const String &comment = "")
     {
-        tft.setTextColor(color, TFT_BLACK);
+        tft.setTextColor(color, themeBg);
         tft.setCursor(labelX, y);
         tft.print(label);
         tft.setCursor(valueX, y);
@@ -2619,17 +2690,17 @@ void drawSolarSummaryPage2()
         if (cond.equalsIgnoreCase("Good"))
             return std::make_pair(TFT_GREEN, "Good");
         if (cond.equalsIgnoreCase("Fair"))
-            return std::make_pair(TFT_YELLOW, "Fair");
+            return std::make_pair((int)themeWarn, "Fair");
         if (cond.equalsIgnoreCase("Poor"))
             return std::make_pair(TFT_RED, "Poor");
         if (cond.indexOf("Storm") >= 0)
             return std::make_pair(TFT_RED, "Storm");
         if (cond.indexOf("Unsettled") >= 0)
             return std::make_pair(TFT_ORANGE, "Unsettled");
-        return std::make_pair(TFT_WHITE, "");
+        return std::make_pair((int)themeFg, "");
     };
 
-    printLine("Mag Field", String(solarData.magneticField, 1), TFT_WHITE);
+    printLine("Mag Field", String(solarData.magneticField, 1), themeFg);
 
     auto [geoColor, geoComment] = conditionColorComment(solarData.geomagneticField);
     printLine("Geo Field", solarData.geomagneticField, geoColor, geoComment);
@@ -2637,9 +2708,9 @@ void drawSolarSummaryPage2()
     auto [snrColor, snrComment] = conditionColorComment(solarData.signalNoise);
     printLine("S/N", solarData.signalNoise, snrColor, snrComment);
 
-    printLine("foF2", solarData.fof2, TFT_WHITE);
-    printLine("MUF Fact", solarData.mufFactor, TFT_WHITE);
-    printLine("MUF", solarData.muf, TFT_WHITE);
+    printLine("foF2", solarData.fof2, themeFg);
+    printLine("MUF Fact", solarData.mufFactor, themeFg);
+    printLine("MUF", solarData.muf, themeFg);
 }
 
 void drawSolarSummaryPage3()
@@ -2650,7 +2721,7 @@ void drawSolarSummaryPage3()
     int lineSpacing = 18;
     int paragraphSpacing = 6;
 
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
     // "VHF/UHF CONDITIONS" ran right up against the corner clock at this
     // font's width - shortened so the two don't touch.
     drawPageHeaderWithClock("VHF/UHF", true);
@@ -2687,22 +2758,22 @@ void drawSolarSummaryPage3()
         if (val.equalsIgnoreCase("Band Open"))
             return {TFT_GREEN, "Excellent"};
         if (val.equalsIgnoreCase("Band Weak"))
-            return {TFT_YELLOW, "Marginal"};
+            return {themeWarn, "Marginal"};
         if (val.equalsIgnoreCase("Band Closed"))
             return {TFT_RED, "No Propagation"};
         if (val.indexOf("ES") >= 0)
             return {TFT_GREEN, "Sporadic-E Active"};
-        return {TFT_WHITE, ""};
+        return {themeFg, ""};
     };
 
-    auto printLine = [&](const String &title, const String &value, uint16_t color = TFT_WHITE, const String &comment = "")
+    auto printLine = [&](const String &title, const String &value, uint16_t color = themeFg, const String &comment = "")
     {
-        tft.setTextColor(TFT_WHITE, TFT_BLACK); // title line always white
+        tft.setTextColor(themeFg, themeBg); // title line always the default text colour
         tft.setCursor(titleX, y);
         tft.print(title);
         y += lineSpacing;
 
-        tft.setTextColor(color, TFT_BLACK);
+        tft.setTextColor(color, themeBg);
         tft.setCursor(resultX, y);
         tft.print(value);
         if (!comment.isEmpty())
@@ -2761,7 +2832,7 @@ void updateWiFiSignalDisplay()
     int signalX = 130;
     int signalY = WIFI_Y0 + 4 * WIFI_LINE_H;
 
-    tft.setTextColor(TFT_BLACK, TFT_BLACK); // erase with background color
+    tft.setTextColor(themeBg, themeBg); // erase with background color
 
     // Erase previous RSSI
     tft.setCursor(rssiX, rssiY);
@@ -2774,7 +2845,7 @@ void updateWiFiSignalDisplay()
     tft.print(lastSignal);
 
     // Draw updated values
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(themeFg, themeBg);
 
     tft.setCursor(rssiX, rssiY);
     tft.print(": ");
@@ -2885,7 +2956,7 @@ static void drawBigClockSevenSeg(long shownEpoch, bool full)
     {
         bigClockColonState = wantColon;
         tft.setFreeFont(&digits60pt7b);
-        tft.setTextColor(wantColon ? bigClockColour : TFT_BLACK);
+        tft.setTextColor(wantColon ? bigClockColour : themeBg);
         tft.drawString(":", 151, 65, 1);
     }
 
@@ -2906,7 +2977,7 @@ static void drawBigClockSevenSeg(long shownEpoch, bool full)
         {
             if (!full && now[i] == bigClockLastDigit[i]) continue;
 
-            tft.setTextColor(TFT_BLACK);
+            tft.setTextColor(themeBg);
             tft.drawString(String(bigClockLastDigit[i]), digitX[i], digitY, 1);
             tft.setTextColor(bigClockColour);
             tft.drawString(String(now[i]), digitX[i], digitY, 1);
@@ -2965,7 +3036,7 @@ static void drawSecondHand(float deg, uint16_t colour)
 
 static void drawDialFace()
 {
-    tft.drawCircle(DIAL_CX, DIAL_CY, DIAL_R, TFT_DARKGREY);
+    tft.drawCircle(DIAL_CX, DIAL_CY, DIAL_R, themeDim);
 
     for (int i = 0; i < 60; i++)
     {
@@ -2973,7 +3044,7 @@ static void drawDialFace()
         float sn = sinf(a), cs = cosf(a);
         bool onHour = (i % 5 == 0);
         int inner = onHour ? TICK_IN_HOUR : TICK_IN_MIN;
-        uint16_t colour = onHour ? TFT_LIGHTGREY : TFT_DARKGREY;
+        uint16_t colour = onHour ? themeDim2 : themeDim;
 
         tft.drawLine(DIAL_CX + (int)lroundf(inner * sn), DIAL_CY - (int)lroundf(inner * cs),
                      DIAL_CX + (int)lroundf(TICK_OUT * sn),
@@ -2981,7 +3052,7 @@ static void drawDialFace()
     }
 
     tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(themeFg, themeBg);
     tft.setTextDatum(MC_DATUM);
     for (int h = 1; h <= 12; h++)
     {
@@ -3012,11 +3083,11 @@ static void drawBigClockAnalog(long shownEpoch, bool full)
     // redrawn unconditionally, which also repairs the gash the second hand
     // leaves behind where it crossed them.
     if (lastHandS >= 0)
-        drawSecondHand(lastHandS * 6.0f, TFT_BLACK);
+        drawSecondHand(lastHandS * 6.0f, themeBg);
     if (lastHandM >= 0 && (mm != lastHandM || hh != lastHandH))
     {
-        drawHand(lastHandM * 6.0f, HAND_MIN, 4, TFT_BLACK);
-        drawHand(lastHandH * 30.0f + lastHandM * 0.5f, HAND_HOUR, 5, TFT_BLACK);
+        drawHand(lastHandM * 6.0f, HAND_MIN, 4, themeBg);
+        drawHand(lastHandH * 30.0f + lastHandM * 0.5f, HAND_HOUR, 5, themeBg);
     }
 
     drawHand(hh * 30.0f + mm * 0.5f, HAND_HOUR, 5, bigClockColour);
@@ -3055,14 +3126,14 @@ static void drawBigClockBinary(long shownEpoch, bool full)
 
         // Bit weights down the left edge, so the columns can be read off.
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         tft.setTextDatum(MR_DATUM);
         for (int b = 0; b < 4; b++)
             tft.drawString(String(1 << b), 26, BIN_Y0 - b * BIN_DY);
 
         // Which pair of columns is which.
         tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         const char *groups[3] = {"HOUR", "MIN", "SEC"};
         for (int g = 0; g < 3; g++)
             tft.drawString(groups[g], BIN_X0 + (int)((g * 2 + 0.5f) * BIN_DX), 30);
@@ -3084,14 +3155,14 @@ static void drawBigClockBinary(long shownEpoch, bool full)
             }
             else
             {
-                tft.fillCircle(cx, cy, BIN_R, TFT_BLACK);
-                tft.drawCircle(cx, cy, BIN_R, TFT_DARKGREY);
+                tft.fillCircle(cx, cy, BIN_R, themeBg);
+                tft.drawCircle(cx, cy, BIN_R, themeDim);
             }
         }
 
         // The decimal reading underneath.
         tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextColor(themeFg, themeBg);
         tft.setTextDatum(MC_DATUM);
         tft.drawString(String(digits[i]), cx, 194);
         tft.setTextDatum(TL_DATUM);
@@ -3190,10 +3261,10 @@ void drawBigClockModeBadge()
 {
     // No frame: just clear the strip so the previous label cannot show through.
     tft.fillRect(BIGCLOCK_BADGE_X, BIGCLOCK_BADGE_Y,
-                 BIGCLOCK_BADGE_W, BIGCLOCK_BADGE_H, TFT_BLACK);
+                 BIGCLOCK_BADGE_W, BIGCLOCK_BADGE_H, themeBg);
 
     tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-    tft.setTextColor(bigClockColour, TFT_BLACK);
+    tft.setTextColor(bigClockColour, themeBg);
     tft.setTextDatum(MC_DATUM);
     tft.drawString(bigClockShowsUtc ? "UTC" : "QTH",
                    BIGCLOCK_BADGE_X + BIGCLOCK_BADGE_W / 2,
@@ -3218,9 +3289,41 @@ static void drawPageHeader(const char *title)
 {
     tft.setTextDatum(TL_DATUM);
     tft.setFreeFont(&Orbitron_Medium8pt7b);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextColor(themeAccent, themeBg);
     tft.drawString(title, 6, 2);
-    tft.drawFastHLine(4, 19, 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, 19, 312, themeDim);
+}
+
+// Cross-page satellite alert strip - the same 20 px band every page's own
+// header occupies, painted over it while an alert-enabled satellite's AOS is
+// inside the configured lead window.  fullRepaint fills the strip and draws
+// the name (once, when the banner first appears); every other tick only the
+// countdown is redrawn, at the same position/font the corner clock already
+// uses on every page header, so its opaque background reliably overwrites the
+// previous value with no separate erase step.
+void drawSatelliteAlertBanner(const char *name, long secsToAos, bool fullRepaint)
+{
+    if (fullRepaint)
+    {
+        tft.fillRect(0, 0, 320, 20, themeWarn);
+        tft.setTextDatum(TL_DATUM);
+        tft.setFreeFont(&Orbitron_Medium8pt7b);
+        tft.setTextColor(themeBg, themeWarn);
+        char nameBuf[20];
+        snprintf(nameBuf, sizeof(nameBuf), "%.14s", name);
+        tft.drawString(nameBuf, 6, 2);
+    }
+
+    long mins = secsToAos / 60;
+    long secs = secsToAos % 60;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "AOS %2ld:%02ld", mins, secs);
+
+    tft.setFreeFont(&JetBrainsMono_Light7pt7b);
+    tft.setTextColor(themeBg, themeWarn);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, 314, 4);
+    tft.setTextDatum(TL_DATUM);
 }
 
 // The corner clock alone, so a page with its own 1 Hz tick (e.g. the WiFi page)
@@ -3235,7 +3338,7 @@ static void drawHeaderCornerClock(bool utc)
               ptm->tm_hour, ptm->tm_min, ptm->tm_sec, utc ? "UTC" : "LOC");
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(buf, 314, 4);
     tft.setTextDatum(TL_DATUM);
@@ -3292,16 +3395,16 @@ void drawNtpStatus()
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     tft.setTextSize(1);
 
-    tft.setTextColor(TFT_BLACK, TFT_BLACK);
+    tft.setTextColor(themeBg, themeBg);
     tft.setCursor(valueX, textY);
     tft.print(": ");
     tft.print(lastValue);
 
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(themeFg, themeBg);
     tft.setCursor(labelX, textY);
     tft.print(" NTP");
 
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(themeFg, themeBg);
     tft.setCursor(valueX, textY);
     tft.print(": ");
     tft.print(value);
@@ -3311,7 +3414,7 @@ void drawNtpStatus()
 
 void drawWiFiQualityPage()
 {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
     drawPageHeaderWithClock("WIFI STATUS", true);
 
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
@@ -3320,9 +3423,9 @@ void drawWiFiQualityPage()
     int y = WIFI_Y0;
     const int lineSpacing = WIFI_LINE_H;
 
-    auto printLine = [&](const String &label, const String &value, uint16_t color = TFT_WHITE)
+    auto printLine = [&](const String &label, const String &value, uint16_t color = themeFg)
     {
-        tft.setTextColor(color, TFT_BLACK);
+        tft.setTextColor(color, themeBg);
         tft.setCursor(10, y);
         tft.print(label);
         tft.setCursor(130, y);
@@ -3394,30 +3497,30 @@ static const int WX_RVALUE = 232;
 
 void drawWeatherPage()
 {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
     tft.setTextDatum(TL_DATUM);
 
     tft.setFreeFont(&Orbitron_Medium8pt7b);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextColor(themeAccent, themeBg);
     tft.drawString("WEATHER", WX_LLABEL, 2);
-    tft.drawFastHLine(4, WX_RULE1, 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, WX_RULE1, 312, themeDim);
 
     // Open-Meteo needs no key, so the only way to be empty is a failed fetch.
     if (!weather.valid)
     {
         tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-        tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+        tft.setTextColor(TFT_ORANGE, themeBg);
         tft.drawString("NO WEATHER DATA", 10, 40);
 
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setTextColor(themeDim2, themeBg);
         tft.drawString("Open-Meteo has not answered yet.", 10, 80);
         tft.drawString("It is retried on the interval set at:", 10, 104);
 
-        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setTextColor(themeAccent, themeBg);
         tft.drawString("http://hamclock.local/weather.html", 10, 128);
 
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         tft.drawString("No account or API key is needed.", 10, 160);
         return;
     }
@@ -3429,11 +3532,11 @@ void drawWeatherPage()
     snprintf(buf, sizeof(buf), "%.19s%s%s", weather.city,
              weather.country[0] ? ", " : "", weather.country);
     tft.setFreeFont(&JetBrainsMono_Bold11pt7b);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(themeFg, themeBg);
     tft.drawString(buf, 10, WX_CITY);
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     snprintf(buf, sizeof(buf), "%.38s", weather.description);   // 8 px per character
     tft.drawString(buf, 10, WX_DESC);
 
@@ -3441,7 +3544,7 @@ void drawWeatherPage()
     uint16_t tc = temperatureColour(weather.temp);
     snprintf(buf, sizeof(buf), "%.1f", weather.temp);
     tft.setFreeFont(&JetBrainsMono_Bold15pt7b);
-    tft.setTextColor(tc, TFT_BLACK);
+    tft.setTextColor(tc, themeBg);
     tft.drawString(buf, 10, WX_TEMP);
     int tw = tft.textWidth(buf);
     drawDegreeMark(10 + tw + 9, WX_TEMP + 6, tc);
@@ -3449,12 +3552,12 @@ void drawWeatherPage()
 
     snprintf(buf, sizeof(buf), "feels %.1f C", weather.feelsLike);
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(buf, 312, WX_TEMP + 10);
     tft.setTextDatum(TL_DATUM);
 
-    tft.drawFastHLine(4, WX_RULE2, 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, WX_RULE2, 312, themeDim);
 
     // --- two-column detail grid --------------------------------------------
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
@@ -3462,9 +3565,9 @@ void drawWeatherPage()
     auto cell = [&](int row, int labelX, int valueX, const char *label, const char *value)
     {
         int y = WX_ROW0 + row * WX_ROWH;
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         tft.drawString(label, labelX, y);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextColor(themeFg, themeBg);
         tft.drawString(value, valueX, y);
     };
 
@@ -3504,7 +3607,7 @@ void drawWeatherPage()
     cell(4, WX_LLABEL, WX_LVALUE, "Sunrise", weather.sunrise);
     cell(4, WX_RLABEL, WX_RVALUE, "Sunset", weather.sunset);
 
-    tft.drawFastHLine(4, WX_RULE3, 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, WX_RULE3, 312, themeDim);
 
     updateWeatherPageClock();
 }
@@ -3521,7 +3624,7 @@ void updateWeatherPageClock()
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d LOC", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(buf, 314, 4);
     tft.setTextDatum(TL_DATUM);
@@ -3535,7 +3638,7 @@ void updateWeatherPageClock()
 
     // The fetch runs every five minutes, so anything much older means the
     // requests are failing.
-    tft.setTextColor(ageMin > 15 ? TFT_ORANGE : TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(ageMin > 15 ? TFT_ORANGE : themeDim, themeBg);
     tft.drawString(padded, WX_LLABEL, WX_FOOT);
 }
 
@@ -3754,25 +3857,25 @@ void drawSunMoonPage(bool fullRedraw)
 
     if (fullRedraw)
     {
-        tft.fillScreen(TFT_BLACK);
+        tft.fillScreen(themeBg);
         tft.setTextDatum(TL_DATUM);
 
         tft.setFreeFont(&Orbitron_Medium8pt7b);
-        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setTextColor(themeAccent, themeBg);
         tft.drawString("SUN & MOON", SM_LLABEL, 2);
-        tft.drawFastHLine(4, SM_RULE1, 312, TFT_DARKGREY);
+        tft.drawFastHLine(4, SM_RULE1, 312, themeDim);
 
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setTextColor(TFT_YELLOW, themeBg);
         tft.drawString("SUN", SM_LLABEL, SM_SUNHDR);
-        tft.drawFastHLine(4, SM_RULE2, 312, TFT_DARKGREY);
-        tft.setTextColor(TFT_SILVER, TFT_BLACK);
+        tft.drawFastHLine(4, SM_RULE2, 312, themeDim);
+        tft.setTextColor(TFT_SILVER, themeBg);
         tft.drawString("MOON", SM_LLABEL, SM_MOONHDR);
-        tft.drawFastHLine(4, SM_RULE3, 312, TFT_DARKGREY);
+        tft.drawFastHLine(4, SM_RULE3, 312, themeDim);
 
         // Labels never change; only the values are repainted each second.
         tft.setFreeFont(&UbuntuMono_Regular8pt7b);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         const char *sunLabels[3][2] = {{"Elevation", "Azimuth"},
                                        {"Rise", "Set"},
                                        {"Grey line", "Day len"}};
@@ -3817,7 +3920,7 @@ void drawSunMoonPage(bool fullRedraw)
     {
         char padded[24];
         snprintf(padded, sizeof(padded), "%-8.8s", text);
-        tft.setTextColor(colour, TFT_BLACK);
+        tft.setTextColor(colour, themeBg);
         tft.drawString(padded, x, y);
     };
 
@@ -3828,53 +3931,53 @@ void drawSunMoonPage(bool fullRedraw)
     };
 
     // --- sun ----------------------------------------------------------------
-    uint16_t sunColour = (sunEl >= 0.0) ? TFT_YELLOW : TFT_DARKGREY;
+    uint16_t sunColour = (sunEl >= 0.0) ? TFT_YELLOW : themeDim;
 
     snprintf(val, sizeof(val), "%+.1f", sunEl);
     value(SM_LVALUE, SM_SROW0, val, sunColour);
     degreeAfter(SM_LVALUE, SM_SROW0, val, sunColour);
 
     snprintf(val, sizeof(val), "%.1f", sunAz);
-    value(SM_RVALUE, SM_SROW0, val, TFT_WHITE);
-    degreeAfter(SM_RVALUE, SM_SROW0, val, TFT_WHITE);
+    value(SM_RVALUE, SM_SROW0, val, themeFg);
+    degreeAfter(SM_RVALUE, SM_SROW0, val, themeFg);
 
     localHm(skyAlmanac.sun.riseValid, skyAlmanac.sun.riseUnix, val, sizeof(val));
-    value(SM_LVALUE, SM_SROW0 + SM_ROWH, val, TFT_WHITE);
+    value(SM_LVALUE, SM_SROW0 + SM_ROWH, val, themeFg);
     localHm(skyAlmanac.sun.setValid, skyAlmanac.sun.setUnix, val, sizeof(val));
-    value(SM_RVALUE, SM_SROW0 + SM_ROWH, val, TFT_WHITE);
+    value(SM_RVALUE, SM_SROW0 + SM_ROWH, val, themeFg);
 
     // Grey line: the band around sunrise and sunset when the terminator runs
     // through the path and the low bands open up over very long distances.
     bool greyLine = fabs(sunEl) <= 6.0;
     value(SM_LVALUE, SM_SROW0 + 2 * SM_ROWH, greyLine ? "YES" : "no",
-          greyLine ? TFT_GREEN : TFT_DARKGREY);
+          greyLine ? TFT_GREEN : themeDim);
 
     if (skyAlmanac.sun.riseValid && skyAlmanac.sun.setValid)
         hoursMinutes(skyAlmanac.sun.setUnix - skyAlmanac.sun.riseUnix, val, sizeof(val));
     else
         snprintf(val, sizeof(val), "-");
-    value(SM_RVALUE, SM_SROW0 + 2 * SM_ROWH, val, TFT_WHITE);
+    value(SM_RVALUE, SM_SROW0 + 2 * SM_ROWH, val, themeFg);
 
     // --- moon ---------------------------------------------------------------
-    uint16_t moonColour = (moon.elDeg >= 0.0) ? TFT_SILVER : TFT_DARKGREY;
+    uint16_t moonColour = (moon.elDeg >= 0.0) ? TFT_SILVER : themeDim;
 
     snprintf(val, sizeof(val), "%+.1f", moon.elDeg);
     value(SM_LVALUE, SM_MROW0, val, moonColour);
     degreeAfter(SM_LVALUE, SM_MROW0, val, moonColour);
 
     snprintf(val, sizeof(val), "%.1f", moon.azDeg);
-    value(SM_RVALUE, SM_MROW0, val, TFT_WHITE);
-    degreeAfter(SM_RVALUE, SM_MROW0, val, TFT_WHITE);
+    value(SM_RVALUE, SM_MROW0, val, themeFg);
+    degreeAfter(SM_RVALUE, SM_MROW0, val, themeFg);
 
     localHm(skyAlmanac.moon.riseValid, skyAlmanac.moon.riseUnix, val, sizeof(val));
-    value(SM_LVALUE, SM_MROW0 + SM_ROWH, val, TFT_WHITE);
+    value(SM_LVALUE, SM_MROW0 + SM_ROWH, val, themeFg);
     localHm(skyAlmanac.moon.setValid, skyAlmanac.moon.setUnix, val, sizeof(val));
-    value(SM_RVALUE, SM_MROW0 + SM_ROWH, val, TFT_WHITE);
+    value(SM_RVALUE, SM_MROW0 + SM_ROWH, val, themeFg);
 
     snprintf(val, sizeof(val), "%.0f %%", moon.illuminatedFrac * 100.0);
-    value(SM_LVALUE, SM_MROW0 + 2 * SM_ROWH, val, TFT_WHITE);
+    value(SM_LVALUE, SM_MROW0 + 2 * SM_ROWH, val, themeFg);
     snprintf(val, sizeof(val), "%.0f", moon.distanceKm);
-    value(SM_RVALUE, SM_MROW0 + 2 * SM_ROWH, val, TFT_WHITE);
+    value(SM_RVALUE, SM_MROW0 + 2 * SM_ROWH, val, themeFg);
 
     // The phase name is wider than a value column, and nothing sits to its
     // right, so it is drawn on its own with the age tacked on the end.
@@ -3882,7 +3985,7 @@ void drawSunMoonPage(bool fullRedraw)
     snprintf(phase, sizeof(phase), "%s  %.1f d",
              moonPhaseName(moon.illuminatedFrac, moon.waxing), moon.ageDays);
     snprintf(padded, sizeof(padded), "%-28.28s", phase);
-    tft.setTextColor(TFT_SILVER, TFT_BLACK);
+    tft.setTextColor(TFT_SILVER, themeBg);
     tft.drawString(padded, SM_LVALUE, SM_MROW0 + 3 * SM_ROWH);
 
     // --- countdown footer ---------------------------------------------------
@@ -3904,7 +4007,7 @@ void drawSunMoonPage(bool fullRedraw)
     snprintf(foot, sizeof(foot), "%s   %s", sunPart, moonPart);
     snprintf(footPad, sizeof(footPad), "%-38.38s", foot);
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.drawString(footPad, SM_LLABEL, SM_FOOT);
 
     // Local time top right, so the rise and set columns read unambiguously.
@@ -3912,7 +4015,7 @@ void drawSunMoonPage(bool fullRedraw)
     struct tm tm_;
     gmtime_r(&lt, &tm_);
     snprintf(val, sizeof(val), "%02d:%02d:%02d QTH", tm_.tm_hour, tm_.tm_min, tm_.tm_sec);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(val, 314, 4);
     tft.setTextDatum(TL_DATUM);
@@ -3928,37 +4031,37 @@ void drawBeaconPage(bool fullRedraw)
 
     if (fullRedraw)
     {
-        tft.fillScreen(TFT_BLACK);
+        tft.fillScreen(themeBg);
         tft.setTextDatum(TL_DATUM);
 
         tft.setFreeFont(&Orbitron_Medium8pt7b);
-        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setTextColor(themeAccent, themeBg);
         tft.drawString("NCDXF BEACONS", BX_BAND, 2);
-        tft.drawFastHLine(4, BX_RULE1, 312, TFT_DARKGREY);
+        tft.drawFastHLine(4, BX_RULE1, 312, themeDim);
 
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         tft.drawString("BAND", BX_BAND, BX_COLHDR);
         tft.drawString("FREQ", BX_FREQ, BX_COLHDR);
         tft.drawString("CALL", BX_CALL, BX_COLHDR);
         tft.drawString("LOCATION", BX_LOC, BX_COLHDR);
         tft.drawString("NEXT", BX_NEXT, BX_COLHDR);
-        tft.drawFastHLine(4, BX_RULE2, 312, TFT_DARKGREY);
-        tft.drawFastHLine(4, BX_RULE3, 312, TFT_DARKGREY);
+        tft.drawFastHLine(4, BX_RULE2, 312, themeDim);
+        tft.drawFastHLine(4, BX_RULE3, 312, themeDim);
 
         // The band and frequency columns never change.
         tft.setFreeFont(&UbuntuMono_Regular8pt7b);
         for (uint8_t b = 0; b < 5; b++)
         {
             int y = BX_ROW0 + b * BX_ROWH;
-            tft.setTextColor(TFT_CYAN, TFT_BLACK);
+            tft.setTextColor(themeAccent, themeBg);
             tft.drawString(beaconBands[b].band, BX_BAND, y);
-            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.setTextColor(themeFg, themeBg);
             tft.drawString(beaconBands[b].freq, BX_FREQ, y);
         }
 
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         tft.drawString("call @22wpm then 100/10/1/0.1 W dashes", BX_BAND, BX_FOOT2);
 
         lastSlot = -1;      // force the callsigns to be painted
@@ -3981,15 +4084,15 @@ void drawBeaconPage(bool fullRedraw)
             char buf[16];
 
             snprintf(buf, sizeof(buf), "%-6.6s", now.call);
-            tft.setTextColor(TFT_GREEN, TFT_BLACK);
+            tft.setTextColor(TFT_GREEN, themeBg);
             tft.drawString(buf, BX_CALL, y);
 
             snprintf(buf, sizeof(buf), "%-12.12s", now.location);
-            tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+            tft.setTextColor(themeDim2, themeBg);
             tft.drawString(buf, BX_LOC, y);
 
             snprintf(buf, sizeof(buf), "%-6.6s", next.call);
-            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.setTextColor(themeDim, themeBg);
             tft.drawString(buf, BX_NEXT, y);
         }
     }
@@ -4005,7 +4108,7 @@ void drawBeaconPage(bool fullRedraw)
         char buf[24];
         snprintf(buf, sizeof(buf), "%02d:%02d:%02d UTC", tm_.tm_hour, tm_.tm_min, tm_.tm_sec);
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setTextColor(themeDim2, themeBg);
         tft.setTextDatum(TR_DATUM);
         tft.drawString(buf, 314, 4);
         tft.setTextDatum(TL_DATUM);
@@ -4017,7 +4120,7 @@ void drawBeaconPage(bool fullRedraw)
         // Fixed width, hard-truncated: 38 characters is what the row holds.
         char padded[48];
         snprintf(padded, sizeof(padded), "%-38.38s", foot);
-        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setTextColor(themeDim2, themeBg);
         tft.drawString(padded, BX_BAND, BX_FOOT1);
     }
 }

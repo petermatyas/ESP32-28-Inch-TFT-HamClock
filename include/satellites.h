@@ -36,6 +36,14 @@ void satellitesSetSite(double latitude, double longitude);
 // it rate-limits itself.  utcNow is a unix timestamp.
 void satellitesLoop(time_t utcNow);
 
+// True when an alert-enabled satellite's AOS is inside the configured lead
+// window right now.  Fills outName/outSecsToAos with the soonest such pass.
+// *outIsNewTrigger is true only on the tick a given pass first enters the
+// window, for a one-shot cue (e.g. a backlight pulse) separate from the
+// per-second countdown redraw.  Safe to call every loop iteration.
+bool satellitesCheckAlert(time_t utcNow, char *outName, size_t nameLen,
+                           long *outSecsToAos, bool *outIsNewTrigger);
+
 // Draw the satellite page.  fullRedraw forces the static furniture to be
 // repainted (page just became active, or the pass list changed).
 // tOffsetHours is the local time offset already used by the rest of the clock.

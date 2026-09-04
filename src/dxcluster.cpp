@@ -11,6 +11,11 @@
 // 1. Configuration and state
 // =============================================================================
 
+// The global colour theme (wip.cpp) - background and the shared chrome roles
+// every page draws with, so this page's look follows whatever style is chosen
+// on the General web page instead of hardcoding TFT_BLACK/TFT_WHITE etc.
+extern uint16_t themeBg, themeFg, themeDim, themeDim2, themeAccent, themeWarn;
+
 #define DX_CONFIG_FILE "/dxcluster.json"
 
 // A cluster login is an identification on a shared amateur network, so there is
@@ -724,9 +729,9 @@ static void drawChip(TFT_eSPI &tft, int x, int y, int w, const char *label, bool
     }
     else
     {
-        tft.fillRoundRect(x, y, w, CHIP_H, 4, TFT_BLACK);
-        tft.drawRoundRect(x, y, w, CHIP_H, 4, TFT_DARKGREY);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.fillRoundRect(x, y, w, CHIP_H, 4, themeBg);
+        tft.drawRoundRect(x, y, w, CHIP_H, 4, themeDim);
+        tft.setTextColor(themeDim, themeBg);
     }
 
     tft.setTextDatum(MC_DATUM);
@@ -737,9 +742,9 @@ static void drawChip(TFT_eSPI &tft, int x, int y, int w, const char *label, bool
 static void drawButton(TFT_eSPI &tft, int x, int y, int w, int h,
                        const char *label, uint16_t colour)
 {
-    tft.fillRoundRect(x, y, w, h, 4, TFT_BLACK);
+    tft.fillRoundRect(x, y, w, h, 4, themeBg);
     tft.drawRoundRect(x, y, w, h, 4, colour);
-    tft.setTextColor(colour, TFT_BLACK);
+    tft.setTextColor(colour, themeBg);
     tft.setTextDatum(MC_DATUM);
     tft.drawString(label, x + w / 2, y + h / 2);
     tft.setTextDatum(TL_DATUM);
@@ -747,20 +752,20 @@ static void drawButton(TFT_eSPI &tft, int x, int y, int w, int h,
 
 static void drawFilterPanel(TFT_eSPI &tft)
 {
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(themeBg);
     tft.setTextDatum(TL_DATUM);
 
     tft.setFreeFont(&Orbitron_Medium8pt7b);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextColor(themeAccent, themeBg);
     tft.drawString("FILTER", 6, 2);
 
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     drawButton(tft, DONE_X, DONE_Y, DONE_W, DONE_H, "DONE", TFT_GREEN);
 
-    tft.drawFastHLine(4, 32, 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, 32, 312, themeDim);
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.drawString("BANDS", 6, 38);
 
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
@@ -772,7 +777,7 @@ static void drawFilterPanel(TFT_eSPI &tft)
     }
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.drawString("MODES", 6, 118);
 
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
@@ -783,17 +788,17 @@ static void drawFilterPanel(TFT_eSPI &tft)
         drawChip(tft, x, y, MODE_W, MODE_NAMES[i], g_modeMask & (1u << i));
     }
 
-    tft.drawFastHLine(4, 172, 312, TFT_DARKGREY);
+    tft.drawFastHLine(4, 172, 312, themeDim);
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.drawString("CONTINENT", 6, 178);
 
     tft.setFreeFont(&UbuntuMono_Regular8pt7b);
     drawChip(tft, CONT_X, CONT_Y, CONT_W, "EU ONLY", g_euOnly);
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextColor(themeDim, themeBg);
     tft.drawString("tap a chip to toggle it", 6, 224);
 }
 
@@ -827,26 +832,26 @@ void dxClusterDrawPage(TFT_eSPI &tft, time_t utcNow, bool fullRedraw)
 
     if (repaint)
     {
-        tft.fillScreen(TFT_BLACK);
+        tft.fillScreen(themeBg);
         tft.setTextDatum(TL_DATUM);
 
         tft.setFreeFont(&Orbitron_Medium8pt7b);
-        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setTextColor(themeAccent, themeBg);
         tft.drawString("DX CLUSTER", 6, 2);
-        tft.drawFastHLine(4, DXY_RULE1, 312, TFT_DARKGREY);
+        tft.drawFastHLine(4, DXY_RULE1, 312, themeDim);
 
         tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         tft.drawString("TIME", DXX_TIME, DXY_COLHDR);
         tft.drawString("FREQ", DXX_FREQ, DXY_COLHDR);
         tft.drawString("DX CALL", DXX_CALL, DXY_COLHDR);
         tft.drawString("MODE", DXX_MODE, DXY_COLHDR);
         tft.drawString("BY", DXX_BY, DXY_COLHDR);
-        tft.drawFastHLine(4, DXY_RULE2, 312, TFT_DARKGREY);
-        tft.drawFastHLine(4, DXY_RULE3, 312, TFT_DARKGREY);
+        tft.drawFastHLine(4, DXY_RULE2, 312, themeDim);
+        tft.drawFastHLine(4, DXY_RULE3, 312, themeDim);
 
         tft.setFreeFont(&UbuntuMono_Regular8pt7b);
-        drawButton(tft, BTN_X, BTN_Y, BTN_W, BTN_H, "FILTER", TFT_CYAN);
+        drawButton(tft, BTN_X, BTN_Y, BTN_W, BTN_H, "FILTER", themeAccent);
     }
 
     // The rows only move when a spot arrives or the filter changes, so they are
@@ -898,30 +903,30 @@ void dxClusterDrawPage(TFT_eSPI &tft, time_t utcNow, bool fullRedraw)
         if (r >= shownCount)
         {
             // Blank the row rather than leaving a stale spot behind.
-            tft.fillRect(0, y, 320, DXY_ROWH - 2, TFT_BLACK);
+            tft.fillRect(0, y, 320, DXY_ROWH - 2, themeBg);
             continue;
         }
 
         const DxSpot &s = shown[r];
 
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         snprintf(buf, sizeof(buf), "%-4.4s", s.hhmm);
         tft.drawString(buf, DXX_TIME, y);
 
         // Right-aligned by padding, so the decimal points line up.
-        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setTextColor(themeWarn, themeBg);
         snprintf(buf, sizeof(buf), "%8.1f", s.freqKHz);
         tft.drawString(buf, DXX_FREQ, y);
 
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextColor(themeFg, themeBg);
         snprintf(buf, sizeof(buf), "%-12.12s", s.call);
         tft.drawString(buf, DXX_CALL, y);
 
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setTextColor(TFT_GREEN, themeBg);
         snprintf(buf, sizeof(buf), "%-5.5s", MODE_NAMES[s.mode]);
         tft.drawString(buf, DXX_MODE, y);
 
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextColor(themeDim, themeBg);
         snprintf(buf, sizeof(buf), "%-6.6s", s.spotter);
         tft.drawString(buf, DXX_BY, y);
     }
@@ -935,7 +940,7 @@ void dxClusterDrawPage(TFT_eSPI &tft, time_t utcNow, bool fullRedraw)
     snprintf(padded, sizeof(padded), "%-28.28s", foot);
 
     tft.setFreeFont(&JetBrainsMono_Light7pt7b);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextColor(themeDim2, themeBg);
     tft.drawString(padded, DXX_TIME, DXY_FOOT);
 
     // UTC in the corner: the spot times the node sends are in UTC, so this is
@@ -948,7 +953,7 @@ void dxClusterDrawPage(TFT_eSPI &tft, time_t utcNow, bool fullRedraw)
         char clock[16];
         snprintf(clock, sizeof(clock), "%02d:%02d:%02d UTC",
                  tm_.tm_hour, tm_.tm_min, tm_.tm_sec);
-        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setTextColor(themeDim2, themeBg);
         tft.setTextDatum(TR_DATUM);
         tft.drawString(clock, 314, 4);
         tft.setTextDatum(TL_DATUM);

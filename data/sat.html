@@ -86,6 +86,15 @@
                                 <label class="form-check-label" for="useLocalTime">Show local time (otherwise UTC)</label>
                             </div>
                         </div>
+                        <div class="col-md-8">
+                            <label class="form-label" for="alertLeadSlider">Alert lead time: <span id="alertLeadValue">5</span> min</label>
+                            <input type="range" class="form-range" id="alertLeadSlider" min="1" max="15" step="1" value="5"
+                                   oninput="document.getElementById('alertLeadValue').textContent = this.value; markDirty()">
+                            <div class="form-text text-secondary">
+                                How long before AOS the on-screen alert banner opens, for
+                                satellites with the bell checked below.
+                            </div>
+                        </div>
                     </div>
 
                     <div class="alert alert-secondary mt-3 mb-0"
@@ -195,12 +204,16 @@ function addRow(id, info) {
         <div class="col-4 col-md-3">
             <input type="number" class="form-control form-control-sm norad" placeholder="NORAD id" value="${id || ''}" oninput="markDirty()">
         </div>
-        <div class="col-5 col-md-6 sat-name small"></div>
+        <div class="col-4 col-md-5 sat-name small"></div>
         <div class="col-2 col-md-2 small text-secondary tleage"></div>
+        <div class="col-1 text-center" title="Alert before this satellite rises">
+            <input type="checkbox" class="form-check-input alert-chk" oninput="markDirty()">
+        </div>
         <div class="col-1 text-end">
             <button class="btn btn-sm btn-outline-danger" onclick="this.closest('.sat-row').remove(); markDirty()">&times;</button>
         </div>`;
     list.appendChild(div);
+    div.querySelector('.alert-chk').checked = !!(info && info.alert);
     if (info) paintRow(div, info);
     return div;
 }
@@ -243,6 +256,9 @@ function load() {
         document.getElementById('tleRefreshHours').value = c.tleRefreshHours;
         document.getElementById('altitudeM').value = Math.round(c.altitudeM);
         document.getElementById('useLocalTime').checked = !!c.useLocalTime;
+        const lead = c.alertLeadMin ?? 5;
+        document.getElementById('alertLeadSlider').value = lead;
+        document.getElementById('alertLeadValue').textContent = lead;
         document.getElementById('siteInfo').textContent =
             `${c.latitude.toFixed(4)}, ${c.longitude.toFixed(4)}`;
         document.getElementById('slotCount').textContent = `(${c.sats.length}/${c.maxSats})`;
@@ -270,9 +286,12 @@ function refreshStatus() {
 }
 
 function save() {
-    const ids = [...document.querySelectorAll('.norad')]
-        .map(i => parseInt(i.value, 10))
-        .filter(v => Number.isFinite(v) && v > 0);
+    const sats = [...document.querySelectorAll('.sat-row')]
+        .map(div => ({
+            norad: parseInt(div.querySelector('.norad').value, 10),
+            alert: div.querySelector('.alert-chk').checked
+        }))
+        .filter(s => Number.isFinite(s.norad) && s.norad > 0);
 
     const body = {
         minElevation: parseFloat(document.getElementById('minElevation').value) || 0,
@@ -280,7 +299,8 @@ function save() {
         tleRefreshHours: parseInt(document.getElementById('tleRefreshHours').value, 10) || 12,
         altitudeM: parseFloat(document.getElementById('altitudeM').value) || 0,
         useLocalTime: document.getElementById('useLocalTime').checked,
-        sats: ids
+        alertLeadMin: parseInt(document.getElementById('alertLeadSlider').value, 10) || 5,
+        sats: sats
     };
 
     document.getElementById('statusMsg').innerHTML = '<span class="text-info">Saving…</span>';

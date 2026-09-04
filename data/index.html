@@ -24,6 +24,19 @@
         .rounded-image-wrapper img { display: block; width: 100%; height: auto; }
         #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
                  z-index: 1080; display: none; }
+
+        .theme-btn {
+            width: 100%;
+            padding: 1rem .5rem;
+            border-radius: 10px;
+            border: 2px solid #5a5a5a;
+            font-size: 1rem;
+            font-weight: 600;
+        }
+        .theme-btn.active {
+            border-color: var(--hc-accent);
+            box-shadow: 0 0 0 .15rem rgba(13, 202, 240, .35);
+        }
     </style>
 </head>
 <body>
@@ -31,8 +44,9 @@
 
     <h1 class="text-center mb-1">General</h1>
     <p class="text-center text-secondary">
-        Settings that apply everywhere, no matter which page is on screen. Per-page
-        looks live on their own pages: <a href="/clock.html" class="link-info">Clock</a>,
+        Settings that apply everywhere, no matter which page is on screen, including the
+        colour theme below. Per-page items - clock face, banner speed, DX filters and the
+        rest - live on their own pages: <a href="/clock.html" class="link-info">Clock</a>,
         <a href="/weather.html" class="link-info">Weather</a>,
         <a href="/sat.html" class="link-info">Satellites</a>,
         <a href="/dx.html" class="link-info">DX Cluster</a>.
@@ -74,6 +88,35 @@
                     <h5 class="card-title">Screen brightness</h5>
                     <label class="form-label" for="brightnessSlider">Backlight: <span id="brightnessValue">100</span>%</label>
                     <input type="range" class="form-range" id="brightnessSlider" min="10" max="100" step="5" value="100">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-10 offset-lg-1">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h5 class="card-title">Colour theme</h5>
+                    <p class="text-secondary small">
+                        One style for every page - background, text and accents - instead of
+                        picking colours per element. The light styles use an actual light
+                        background, not just brighter text on black.
+                    </p>
+                    <div class="row g-3" id="themeGrid">
+                        <div class="col-6 col-md-3">
+                            <button class="theme-btn" id="theme0" onclick="applyTheme(0)">🌙 Classic Dark</button>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <button class="theme-btn" id="theme1" onclick="applyTheme(1)">🕯️ Amber Dark</button>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <button class="theme-btn" id="theme2" onclick="applyTheme(2)">☀️ Classic Light</button>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <button class="theme-btn" id="theme3" onclick="applyTheme(3)">📄 Warm Light</button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -168,6 +211,48 @@ function toast(msg, kind) {
     t.style.display = 'block';
     clearTimeout(t._h);
     t._h = setTimeout(function () { t.style.display = 'none'; }, 2500);
+}
+
+function hexFrom565(rgb565) {
+    var r = Math.round(((rgb565 >> 11) & 0x1F) * 255 / 31);
+    var g = Math.round(((rgb565 >> 5) & 0x3F) * 255 / 63);
+    var b = Math.round((rgb565 & 0x1F) * 255 / 31);
+    return '#' + [r, g, b].map(function (x) { return x.toString(16).padStart(2, '0'); }).join('');
+}
+
+// --- Colour theme -----------------------------------------------------------
+// Mirrors THEME_PALETTES in wip.cpp - only bg/fg/accent are needed here, to
+// paint each button as a small preview of the style it applies.
+var THEMES = [
+    { name: 'Classic Dark', bg: 0x0000, fg: 0xFFFF, accent: 0x07FF },
+    { name: 'Amber Dark',   bg: 0x0000, fg: 0xFEA0, accent: 0xFDA0 },
+    { name: 'Classic Light', bg: 0xFFFF, fg: 0x0000, accent: 0x000F },
+    { name: 'Warm Light',   bg: 0xFFDE, fg: 0x0000, accent: 0x7800 }
+];
+
+THEMES.forEach(function (t, i) {
+    var btn = document.getElementById('theme' + i);
+    btn.style.background = hexFrom565(t.bg);
+    btn.style.color = hexFrom565(t.fg);
+    btn.style.borderColor = hexFrom565(t.accent);
+});
+
+function highlightTheme(id) {
+    THEMES.forEach(function (t, i) {
+        document.getElementById('theme' + i).classList.toggle('active', i === id);
+    });
+}
+
+function applyTheme(id) {
+    fetch('/settheme', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ theme: id })
+    }).then(function (r) {
+        if (!r.ok) throw new Error();
+        highlightTheme(id);
+        toast(THEMES[id].name + ' style applied', 'success');
+    }).catch(function () { toast('Could not apply the style', 'danger'); });
 }
 
 // --- Station: callsign + position -------------------------------------------
@@ -330,6 +415,8 @@ function loadConfig() {
     fetch('/config').then(function (r) { return r.json(); }).then(function (c) {
         document.getElementById('latitudeInput').value = c.latitude ?? '';
         document.getElementById('longitudeInput').value = c.longitude ?? '';
+
+        highlightTheme(c.colourTheme ?? 0);
 
         var minutes = c.screenSaverTimeout ?? 0;
         document.getElementById('screenSaverSlider').value = minutes;
