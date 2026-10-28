@@ -32,6 +32,7 @@
 #include "html_page.h"
 #include "satellites.h"
 #include "dxcluster.h"
+#include "news.h"
 #include <new>
 #include <esp_heap_caps.h>
 #include <sgp4.h>
@@ -57,7 +58,7 @@ int tOffset = 0; // will be updated via configuration device time (Iphone) and l
 Preferences prefs;
 // --- globals ---
 uint8_t activePage = 1;
-const uint8_t MAX_PAGES = 11;   // page 1 merged the old dual-clock and big-clock pages
+const uint8_t MAX_PAGES = 12;   // page 1 merged the old dual-clock and big-clock pages; 12 is news
 unsigned long lastTouchMs = 0;
 bool wasTouching = false;
 int scanCount = 0;
@@ -265,6 +266,7 @@ bool redrawWeatherPage = true;
 bool redrawBeaconPage = true;
 bool redrawSunMoonPage = true;
 bool redrawDxPage = true;
+bool redrawNewsPage = true;
 
 // fetchWeatherData() used to parse the OpenWeather response into locals and
 // throw everything away except the scrolling banner; the weather page needs the
@@ -575,6 +577,9 @@ void setup()
     mountAndListSPIFFS();
     // Load saved settings first
     loadSettings();
+    // Early, while the heap is still in one piece: its 5 KB block would
+    // otherwise split the large free block TLS needs.
+    newsBegin();
     applyBrightness();
     // Display PNG from SPIFFS
     displayPNGfromSPIFFS(startupLogo.c_str(), 0);
@@ -969,6 +974,7 @@ doc ["colourTheme"] = colourTheme;
 
             satellitesRegisterRoutes(server);
             dxClusterRegisterRoutes(server);
+            newsRegisterRoutes(server);
 
             server.begin();
 
@@ -1913,6 +1919,13 @@ void loop()
         fetchWeatherData();
     }
 
+    // 📰 News feeds, one at a time, only while the news page is switched on.
+    if (newsFetchDue(currentMillis))
+    {
+        ssReleaseSprites(); // TLS needs the room
+        newsFetchNext();
+    }
+
     // 🌤️ Refresh propagation data every 5 minutes
     if (currentMillis - previousMillisForPropagationDataUpdate >= propagationInterval)
     {
@@ -2124,6 +2137,19 @@ void loop()
         {
             dxClusterDrawPage(tft, (time_t)timeClient.getEpochTime(), redrawDxPage);
             redrawDxPage = false;
+            break;
+        }
+
+        case 12:
+        {
+            // Switched off on the web page while it was showing.
+            if (!newsEnabled())
+            {
+                activatePage(1);
+                break;
+            }
+            newsDrawPage(tft, (time_t)timeClient.getEpochTime(), tOffset, redrawNewsPage);
+            redrawNewsPage = false;
             break;
         }
         }
@@ -3069,6 +3095,9 @@ static void activatePage(uint8_t page)
     case 11:
         redrawDxPage = true;
         break;
+    case 12:
+        redrawNewsPage = true;
+        break;
     }
 }
 
@@ -3123,8 +3152,12 @@ void handleTouchToRotatePage()
 
             // Tap the right half to go forward, the left half to go back.
             bool forward = (x >= tft.width() / 2);
-            uint8_t next = forward ? (activePage % MAX_PAGES) + 1
-                                   : (activePage + MAX_PAGES - 2) % MAX_PAGES + 1;
+            uint8_t next = activePage;
+            do
+            {
+                next = forward ? (next % MAX_PAGES) + 1
+                               : (next + MAX_PAGES - 2) % MAX_PAGES + 1;
+            } while (next == 12 && !newsEnabled()); // a switched-off page is skipped
 
             // The touch x is printed so a mirrored panel is obvious without a
             // debug build: if a tap on the right reports a low x, swap

@@ -9,6 +9,7 @@
         { href: '/weather.html', label: 'Weather' },
         { href: '/sat.html',    label: 'Satellites' },
         { href: '/dx.html',     label: 'DX Cluster' },
+        { href: '/news.html',   label: 'News' },
         { href: '/wifi.html',   label: 'WiFi' }
     ];
 

@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "refreshMin": 15,
+  "feeds": [
+    {
+      "name": "ARRL",
+      "url": "http://www.arrl.org/news/rss"
+    },
+    {
+      "name": "Telex",
+      "url": "https://telex.hu/rss"
+    },
+    {
+      "name": "",
+      "url": ""
+    },
+    {
+      "name": "",
+      "url": ""
+    }
+  ]
+}
