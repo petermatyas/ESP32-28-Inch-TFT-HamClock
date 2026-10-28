@@ -130,9 +130,13 @@
                     <div class="row g-3 align-items-center">
                         <div class="col-md-8">
                             <label class="form-label" for="screenSaverSlider" id="screenSaverLabel">Screen saver after: 5 min.</label>
-                            <input type="range" class="form-range" id="screenSaverSlider" min="0" max="120" step="2" value="5">
+                            <input type="range" class="form-range" id="screenSaverSlider" min="2" max="120" step="2" value="6">
                         </div>
                         <div class="col-md-4">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" role="switch" id="useScreenSaver">
+                                <label class="form-check-label" for="useScreenSaver">Screen saver</label>
+                            </div>
                             <div class="form-check">
                                 <input class="form-check-input" type="checkbox" id="autoPageChange">
                                 <label class="form-check-label" for="autoPageChange">Auto page change</label>
@@ -313,9 +317,21 @@ brightnessSlider.addEventListener('change', function () {
 // --- Screensaver + auto page change --------------------------------------
 var screenSaverSlider = document.getElementById('screenSaverSlider');
 var screenSaverLabel = document.getElementById('screenSaverLabel');
-screenSaverSlider.addEventListener('input', function () {
-    screenSaverLabel.textContent = (this.value == 120)
-        ? 'Screen saver disabled' : 'Screen saver after: ' + this.value + ' min.';
+var useScreenSaver = document.getElementById('useScreenSaver');
+function showScreenSaverState() {
+    screenSaverSlider.disabled = !useScreenSaver.checked;
+    screenSaverLabel.textContent = useScreenSaver.checked
+        ? 'Screen saver after: ' + screenSaverSlider.value + ' min.' : 'Screen saver disabled';
+}
+screenSaverSlider.addEventListener('input', showScreenSaverState);
+useScreenSaver.addEventListener('change', function () {
+    showScreenSaverState();
+    fetch('/setUseScreenSaver?enabled=' + this.checked)
+        .then(function (r) {
+            if (!r.ok) throw new Error();
+            toast('Screen saver ' + (this.checked ? 'enabled' : 'disabled'), 'success');
+        }.bind(this))
+        .catch(function () { toast('Could not update the screen saver', 'danger'); });
 });
 screenSaverSlider.addEventListener('change', function () {
     var minutes = parseInt(this.value, 10);
@@ -418,10 +434,9 @@ function loadConfig() {
 
         highlightTheme(c.colourTheme ?? 0);
 
-        var minutes = c.screenSaverTimeout ?? 0;
-        document.getElementById('screenSaverSlider').value = minutes;
-        screenSaverLabel.textContent = (minutes == 120)
-            ? 'Screen saver disabled' : 'Screen saver after: ' + minutes + ' min.';
+        screenSaverSlider.value = c.screenSaverTimeout ?? 60;
+        useScreenSaver.checked = !!c.useScreenSaver;
+        showScreenSaverState();
         document.getElementById('autoPageChange').checked = !!c.autoPageChange;
 
         var brightness = c.brightness ?? 100;

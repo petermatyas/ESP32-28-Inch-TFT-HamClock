@@ -13,6 +13,6 @@
   "bigClockShowsUtc": false,
   "bigClockStyle": 3,
   "weatherIntervalMin": 30,
-  "screenSaverTimeout": 5880000,
+  "screenSaverTimeout": 300000,
   "brightness": 100
 }

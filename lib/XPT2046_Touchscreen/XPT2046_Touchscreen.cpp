@@ -121,7 +121,16 @@ void XPT2046_Touchscreen::update()
 {
 	int16_t data[6];
 	int z;
-	if (!isrWake) return;
+	// Upstream gates every poll on isrWake, which the FALLING-edge interrupt
+	// on tirqPin (T_IRQ, GPIO36 on this board) is supposed to set back to
+	// true. isrWake starts true, so the very first poll always runs — but
+	// that poll finds no touch, isrWake latches false, and on this board the
+	// IRQ line never produces a clean edge afterward (GPIO34-39 have no
+	// internal pull, and this panel's T_IRQ apparently isn't pulled up
+	// elsewhere), so touched()/getPoint() go dead forever. Polling XPT2046
+	// directly over SPI on every call (rate-limited by MSEC_THRESHOLD below,
+	// same as upstream) sidesteps the interrupt path entirely and is what
+	// actually detects touches on this hardware.
 	uint32_t now = millis();
 	if (now - msraw < MSEC_THRESHOLD) return;
 	if (_pspi) {

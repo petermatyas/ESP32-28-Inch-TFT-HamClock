@@ -37,13 +37,13 @@
 #include <sgp4.h>
 #include "html_success.h"
 #include "digits60pt7b.h"
+#include <math.h>
+#include <string.h>
 
 const byte DNS_PORT = 53;
 DNSServer dnsServer;
 IPAddress apIP(192, 168, 4, 1);
 
-static unsigned long lastDotUpdate = 0;                 // for screen saver
-static unsigned long nextDotDelay = random(1000, 2001); // for screen saver
 unsigned long currentMillis = millis();
 unsigned long lastActivity = 0;                        // Last time user interacted (for screensaver)
 unsigned long screenSaverTimeout = 1000 * 60 * 60 * 2; // 120 minute
@@ -384,6 +384,8 @@ static void wifiRegisterRoutes();
 static uint8_t wifiNetCount();
 static bool wifiNetAdd(const String &ssid, const String &pass);
 void fetchWeatherData();
+static void loadTimeZone();
+static void applyLocalOffset();
 String formatLocalTime(long epochTime);
 String convertEpochToTimeString(long epochTime);
 void displayTime(int x, int y, String time, String &previousTime, int yOffset, uint16_t fontColor);
@@ -646,6 +648,7 @@ void setup()
   doc["italicClockFonts"] = italicClockFonts;
 doc["screenSaverTimeout"] = screenSaverTimeout / 60000;  // convert ms → minutes
 doc ["autoPageChange"] =autoPageChange;
+doc ["useScreenSaver"] = useScreenSaver;
 doc ["bigClockShowsUtc"] = bigClockShowsUtc;
 doc ["bigClockStyle"] = bigClockStyle;
 doc ["bigClockColour"] = bigClockColour;
@@ -953,6 +956,17 @@ doc ["colourTheme"] = colourTheme;
                           activatePage(1);
                       });
 
+            server.on("/setUseScreenSaver", HTTP_GET, []()
+                      {
+                          if (server.hasArg("enabled"))
+                          {
+                              useScreenSaver = (server.arg("enabled") == "true");
+                              lastActivity = millis(); // count the timeout from now
+                          }
+                          server.send(200, "text/plain", useScreenSaver ? "ScreenSaver ON" : "ScreenSaver OFF");
+                          saveSettings();
+                      });
+
             satellitesRegisterRoutes(server);
             dxClusterRegisterRoutes(server);
 
@@ -967,6 +981,8 @@ doc ["colourTheme"] = colourTheme;
                 delay(500);
             }
             tryToRetrieveUTCoffsetFromFirstConfiguration();
+            loadTimeZone();
+            applyLocalOffset();
 
             fetchWeatherData();
             fetchSolarData();
@@ -985,6 +1001,832 @@ doc ["colourTheme"] = colourTheme;
             // Calculate the initial position (rightmost position)
             scrollingTextXposition = scrollingText.width();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 👀 Screensaver: a dark, star-speckled background with a pair of cartoon eyes
+// that idle, glance around and cycle through small emotional beats on their
+// own. Both eyes are drawn identically (they always look/blink together) via
+// a small reusable off-screen sprite, so each is blitted to the screen in one
+// shot instead of being erased-then-redrawn in place — that's what keeps the
+// animation flicker-free. Star twinkle is handled separately: stars never
+// move, so refreshing one just means redrawing that single pixel in a new
+// shade, which likewise never flickers.
+// ---------------------------------------------------------------------------
+struct ScreensaverStar
+{
+    int16_t x, y;
+    float phase; // randomizes each star's twinkle so they don't pulse in sync
+};
+static const int SS_STAR_COUNT = 70;
+static ScreensaverStar ssStars[SS_STAR_COUNT];
+static bool ssStarsReady = false;
+
+// Eye geometry, in the eye sprite's own local coordinates.
+static const int16_t SS_EYE_RX = 48, SS_EYE_RY = 36;
+static const int16_t SS_IRIS_R = 17, SS_PUPIL_R = 7;
+static const int16_t SS_LOCAL_CX = 64, SS_LOCAL_CY = 66;
+// Sprite big enough to hold the eye at its largest (surprised) plus the
+// sleeping "zzz" and the sad tear without clipping.
+static const int16_t SS_SPRITE_W = 140, SS_SPRITE_H = 132;
+// Where each eye's sprite lands on screen (display is 320x240 landscape).
+static const int16_t SS_LEFT_BOX_X = 32, SS_RIGHT_BOX_X = 160, SS_BOX_Y = 54;
+
+static TFT_eSprite ssEyeSprite(&tft);
+static bool ssSpriteReady = false;
+
+static bool ssEnsureSprite()
+{
+    if (!ssSpriteReady)
+    {
+        ssEyeSprite.setColorDepth(8);
+        ssSpriteReady = ssEyeSprite.createSprite(SS_SPRITE_W, SS_SPRITE_H) != nullptr;
+        if (!ssSpriteReady)
+            Serial.println("⚠️ Screensaver eye sprite allocation failed — skipping eye animation.");
+    }
+    return ssSpriteReady;
+}
+
+static inline bool ssInsideBox(int16_t x, int16_t y, int16_t boxX, int16_t boxY)
+{
+    return x >= boxX && x < boxX + SS_SPRITE_W && y >= boxY && y < boxY + SS_SPRITE_H;
+}
+
+static inline bool ssInsideEyeBoxes(int16_t x, int16_t y)
+{
+    return ssInsideBox(x, y, SS_LEFT_BOX_X, SS_BOX_Y) || ssInsideBox(x, y, SS_RIGHT_BOX_X, SS_BOX_Y);
+}
+
+enum EyeMood
+{
+    EYE_NEUTRAL,
+    EYE_BLINK,
+    EYE_LOOK_LEFT,
+    EYE_LOOK_RIGHT,
+    EYE_LOOK_UP,
+    EYE_LOOK_DOWN,
+    EYE_SURPRISED,
+    EYE_BORED,
+    EYE_SLEEPY,
+    EYE_ASLEEP,
+    EYE_SQUINT,
+    EYE_HAPPY,
+    EYE_SAD,
+    EYE_ANGRY,
+    EYE_WINK,
+    EYE_CURIOUS,
+    EYE_SUSPICIOUS,
+};
+
+struct EyeMoodSpec
+{
+    EyeMood mood;
+    uint16_t minMs, maxMs;
+    uint8_t weight;
+};
+// How often each mood is picked, and how long it lasts once picked.
+static const EyeMoodSpec SS_MOOD_TABLE[] = {
+    {EYE_BLINK, 140, 220, 16},
+    {EYE_LOOK_LEFT, 700, 1400, 10},
+    {EYE_LOOK_RIGHT, 700, 1400, 10},
+    {EYE_LOOK_UP, 600, 1200, 8},
+    {EYE_LOOK_DOWN, 600, 1200, 8},
+    {EYE_SURPRISED, 500, 900, 5},
+    {EYE_BORED, 1800, 3200, 8},
+    {EYE_SLEEPY, 1500, 2600, 6},
+    {EYE_ASLEEP, 6000, 14000, 5},
+    {EYE_SQUINT, 700, 1300, 6},
+    {EYE_HAPPY, 1000, 1800, 7},
+    {EYE_SAD, 1200, 2200, 6},
+    {EYE_ANGRY, 900, 1700, 6},
+    {EYE_WINK, 500, 800, 5},
+    {EYE_CURIOUS, 900, 1800, 7},
+    {EYE_SUSPICIOUS, 1200, 2200, 6},
+};
+
+static void ssInitStars()
+{
+    for (int i = 0; i < SS_STAR_COUNT; i++)
+    {
+        ssStars[i].x = random(0, 320);
+        ssStars[i].y = random(0, 240);
+        ssStars[i].phase = random(0, 628) / 100.0f; // 0..2π
+    }
+    ssStarsReady = true;
+}
+
+static inline uint16_t ssStarColor(const ScreensaverStar &s, unsigned long nowMs)
+{
+    float t = 0.5f + 0.5f * sinf(nowMs / 900.0f + s.phase);
+    uint8_t b = (uint8_t)(50 + t * 180); // gentle 50..230 twinkle
+    return tft.color565(b, b, b);
+}
+
+// Redraws every star on a blanked screen. Only used once, when the
+// screensaver first activates, to paint the initial sky.
+static void ssDrawStarfield(unsigned long nowMs)
+{
+    tft.fillScreen(TFT_BLACK);
+    for (int i = 0; i < SS_STAR_COUNT; i++)
+        tft.drawPixel(ssStars[i].x, ssStars[i].y, ssStarColor(ssStars[i], nowMs));
+}
+
+// Star positions never change, so "twinkling" one is just redrawing the same
+// pixel in a new shade — no erase step, so nothing to flicker. Stars that sit
+// under an eye are skipped here; the eye sprite redraws them itself each
+// frame (see ssRenderEyeBox), since it's already repainting that patch.
+static void ssTwinkleStars(unsigned long nowMs)
+{
+    for (int i = 0; i < SS_STAR_COUNT; i++)
+    {
+        const ScreensaverStar &s = ssStars[i];
+        if (!ssInsideEyeBoxes(s.x, s.y))
+            tft.drawPixel(s.x, s.y, ssStarColor(s, nowMs));
+    }
+}
+
+// A small fan of tapering strokes along the outer half of the upper eyelid —
+// purely a stylized flourish. Fades away as the eye closes so it doesn't
+// float oddly over shut lids.
+static void ssDrawEyelashes(TFT_eSPI &gfx, int16_t rx, int16_t ry, float openness)
+{
+    if (openness < 0.55f)
+        return;
+    static const float SS_LASH_T[] = {-0.05f, 0.25f, 0.5f, 0.72f};
+    const int lashCount = 4;
+    for (int i = 0; i < lashCount; i++)
+    {
+        float t = SS_LASH_T[i];
+        float baseX = t * rx;
+        float baseY = -ry * sqrtf(1.0f - t * t);
+        float len = (7.0f + i * 2.2f) * openness;
+        float angle = -1.55f - t * 0.55f; // mostly upward, tilting outward
+        float tipX = baseX + cosf(angle) * len;
+        float tipY = baseY + sinf(angle) * len;
+        gfx.drawWideLine(SS_LOCAL_CX + baseX, SS_LOCAL_CY + baseY,
+                          SS_LOCAL_CX + tipX, SS_LOCAL_CY + tipY, 2.0f, TFT_DARKGREY);
+    }
+}
+
+// Angry: a straight brow slanting down toward the nose, like furrowed
+// eyebrows. Mirrored per eye so both brows angle toward the center.
+static void ssDrawAngryBrow(TFT_eSPI &gfx, int16_t rx, int16_t ry, bool isLeftEye)
+{
+    float mirror = isLeftEye ? 1.0f : -1.0f;
+    int16_t outerX = (int16_t)(-mirror * (rx - 4));
+    int16_t innerX = (int16_t)(mirror * (rx - 10));
+    int16_t outerY = SS_LOCAL_CY - ry - 16; // outer corner, well clear above the eye
+    int16_t innerY = SS_LOCAL_CY - ry - 2;  // inner corner, dips down toward the nose
+    gfx.drawWideLine(SS_LOCAL_CX + outerX, outerY,
+                      SS_LOCAL_CX + innerX, innerY, 4.0f, TFT_LIGHTGREY);
+}
+
+// Curious/quizzical: a single eyebrow arches up over the outer half of the
+// eye, the classic "hmm?" look. Mirrored per eye so the arch always sits on
+// the outer side of the face rather than crowding the nose.
+static void ssDrawCuriousBrow(TFT_eSPI &gfx, int16_t rx, int16_t ry, bool isLeftEye)
+{
+    float mirror = isLeftEye ? 1.0f : -1.0f;
+    const int steps = 8;
+    float prevX = 0.0f, prevY = 0.0f;
+    for (int i = 0; i <= steps; i++)
+    {
+        float t = (float)i / steps;                // 0 = above eye center, 1 = outer corner
+        float x = -mirror * (rx - 6) * t;
+        float y = -(ry + 12) - sinf(t * 3.14159f) * 9.0f; // raised arch, clear above the eye
+        if (i > 0)
+            gfx.drawWideLine(SS_LOCAL_CX + prevX, SS_LOCAL_CY + prevY,
+                              SS_LOCAL_CX + x, SS_LOCAL_CY + y, 3.0f, TFT_LIGHTGREY);
+        prevX = x;
+        prevY = y;
+    }
+}
+
+// Suspicious/sneaky: a heavy, flat lowered brow sitting close over the eye,
+// hooding it — paired in runScreensaverEye with a narrowed, slow sideways
+// glance to read as scheming rather than sleepy.
+static void ssDrawSuspiciousBrow(TFT_eSPI &gfx, int16_t rx, int16_t ry)
+{
+    int16_t y = SS_LOCAL_CY - ry - 6; // just above the eye, hooding it without hiding under the lid
+    gfx.drawWideLine(SS_LOCAL_CX - rx + 4, y, SS_LOCAL_CX + rx - 4, y, 4.0f, TFT_LIGHTGREY);
+}
+
+// The regular lidded eye: sclera + iris/pupil offset toward (dx,dy), with
+// eyelids closing in from top and bottom to encode openness (1=open..0=shut).
+// Covers neutral, blinking, look-around, surprised, bored, sleepy and squint.
+// Drawn onto whatever graphics target is passed in (the eye sprite, always).
+static void ssDrawStandardEye(TFT_eSPI &gfx, int16_t dx, int16_t dy, float openness, float pupilScale, float scleraScale)
+{
+    openness = constrain(openness, 0.0f, 1.0f);
+    int16_t rx = (int16_t)(SS_EYE_RX * scleraScale);
+    int16_t ry = (int16_t)(SS_EYE_RY * scleraScale);
+
+    gfx.fillEllipse(SS_LOCAL_CX, SS_LOCAL_CY, rx, ry, TFT_WHITE);
+    gfx.drawEllipse(SS_LOCAL_CX, SS_LOCAL_CY, rx, ry, TFT_DARKGREY);
+
+    int16_t maxDX = rx - SS_IRIS_R - 2;
+    int16_t maxDY = ry - SS_IRIS_R - 2;
+    int16_t ix = SS_LOCAL_CX + constrain(dx, (int16_t)-maxDX, maxDX);
+    int16_t iy = SS_LOCAL_CY + constrain(dy, (int16_t)-maxDY, maxDY);
+
+    gfx.fillCircle(ix, iy, SS_IRIS_R, gfx.color565(40, 24, 12));       // limbal ring
+    gfx.fillCircle(ix, iy, SS_IRIS_R - 2, gfx.color565(101, 67, 33)); // warm brown iris
+    gfx.fillCircle(ix, iy, (int16_t)(SS_PUPIL_R * pupilScale), TFT_BLACK);
+    if (openness > 0.25f)
+        gfx.fillCircle(ix - 4, iy - 6, 3, TFT_WHITE); // life-like corner sparkle
+
+    if (openness < 0.99f)
+    {
+        int16_t lidH = (int16_t)(ry * (1.0f - openness)) + 1;
+        gfx.fillRect(SS_LOCAL_CX - rx - 2, SS_LOCAL_CY - ry - 2, 2 * rx + 4, lidH, TFT_BLACK);
+        gfx.fillRect(SS_LOCAL_CX - rx - 2, SS_LOCAL_CY + ry - lidH + 2, 2 * rx + 4, lidH, TFT_BLACK);
+    }
+
+    ssDrawEyelashes(gfx, rx, ry, openness);
+}
+
+// Happy: the eye reduces to a cheerful upward "⌢" arc, the classic squinting
+// cartoon smile-eye, with a tiny joyful bob.
+static void ssDrawHappyEye(TFT_eSPI &gfx, unsigned long nowMs)
+{
+    const int16_t W = SS_EYE_RX - 6, H = 19;
+    const float bob = sinf(nowMs / 260.0f) * 1.7f;
+    const int steps = 12;
+    float prevX = -W;
+    float prevY = H * (1.0f - (prevX * prevX) / (float)(W * W));
+    for (int i = 1; i <= steps; i++)
+    {
+        float x = -W + (2.0f * W * i) / steps;
+        float y = H * (1.0f - (x * x) / (float)(W * W));
+        gfx.drawWideLine(SS_LOCAL_CX + prevX, SS_LOCAL_CY - prevY + bob, SS_LOCAL_CX + x, SS_LOCAL_CY - y + bob, 5.5f, TFT_WHITE);
+        prevX = x;
+        prevY = y;
+    }
+}
+
+// Sad: a half-lidded, downcast eye under a drooping brow line, with a single
+// tear that slides down and loops.
+static void ssDrawSadEye(TFT_eSPI &gfx, unsigned long elapsed)
+{
+    ssDrawStandardEye(gfx, 0, 8, 0.55f, 0.85f, 0.95f);
+
+    gfx.drawWideLine(SS_LOCAL_CX - SS_EYE_RX + 3, SS_LOCAL_CY - SS_EYE_RY + 6,
+                      SS_LOCAL_CX + SS_EYE_RX - 8, SS_LOCAL_CY - SS_EYE_RY + 18, 4.0f, TFT_DARKGREY);
+
+    unsigned long t = elapsed % 1600UL;
+    if (t < 1400UL)
+    {
+        int16_t tearY = SS_LOCAL_CY + SS_EYE_RY - 3 + (int16_t)((t * 21) / 1400);
+        gfx.fillCircle(SS_LOCAL_CX - 11, tearY, 3, TFT_SKYBLUE);
+    }
+}
+
+// Asleep: closed, gently curved eyelids that "breathe" with a slow bob, plus
+// a little "z" drifting up and away every couple of seconds.
+static void ssDrawAsleepEye(TFT_eSPI &gfx, unsigned long nowMs, unsigned long elapsed)
+{
+    const int16_t W = SS_EYE_RX - 7, H = 8;
+    const float bob = sinf(nowMs / 1000.0f) * 2.1f;
+    const int steps = 10;
+    float prevX = -W;
+    float prevY = -H * (1.0f - (prevX * prevX) / (float)(W * W));
+    for (int i = 1; i <= steps; i++)
+    {
+        float x = -W + (2.0f * W * i) / steps;
+        float y = -H * (1.0f - (x * x) / (float)(W * W));
+        gfx.drawWideLine(SS_LOCAL_CX + prevX, SS_LOCAL_CY + prevY + bob, SS_LOCAL_CX + x, SS_LOCAL_CY + y + bob, 5.5f, TFT_DARKGREY);
+        prevX = x;
+        prevY = y;
+    }
+
+    gfx.setTextFont(1);
+    gfx.setTextColor(TFT_SKYBLUE, TFT_BLACK);
+    for (int n = 0; n < 3; n++)
+    {
+        unsigned long cyc = (elapsed + n * 800UL) % 2400UL;
+        if (cyc > 2000UL)
+            continue; // pause between repeats
+        float p = cyc / 2000.0f;
+        int16_t zx = SS_LOCAL_CX + SS_EYE_RX + 3 + (int16_t)(p * 8);
+        int16_t zy = SS_LOCAL_CY - SS_EYE_RY - 6 - (int16_t)(p * 20);
+        gfx.setTextSize(n == 0 ? 2 : 1);
+        gfx.setCursor(zx, zy);
+        gfx.print('z');
+    }
+    gfx.setTextSize(1);
+}
+
+// Renders one eye — background stars local to its box, then whichever shape
+// the current mood calls for — into the shared sprite and blits it to screen
+// in a single push, which is what avoids any visible erase/redraw flicker.
+static void ssRenderEyeBox(int16_t boxX, int16_t boxY, unsigned long nowMs, unsigned long elapsed,
+                            bool special, EyeMood activeMood,
+                            int16_t dx, int16_t dy, float openness, float pupilScale, float scleraScale,
+                            bool isLeftEye)
+{
+    ssEyeSprite.fillSprite(TFT_BLACK);
+    for (int i = 0; i < SS_STAR_COUNT; i++)
+    {
+        const ScreensaverStar &s = ssStars[i];
+        if (ssInsideBox(s.x, s.y, boxX, boxY))
+            ssEyeSprite.drawPixel(s.x - boxX, s.y - boxY, ssStarColor(s, nowMs));
+    }
+
+    if (special)
+    {
+        switch (activeMood)
+        {
+        case EYE_HAPPY:
+            ssDrawHappyEye(ssEyeSprite, nowMs);
+            break;
+        case EYE_SAD:
+            ssDrawSadEye(ssEyeSprite, elapsed);
+            break;
+        case EYE_ASLEEP:
+            ssDrawAsleepEye(ssEyeSprite, nowMs, elapsed);
+            break;
+        default:
+            break;
+        }
+    }
+    else
+    {
+        ssDrawStandardEye(ssEyeSprite, dx, dy, openness, pupilScale, scleraScale);
+        int16_t rx = (int16_t)(SS_EYE_RX * scleraScale), ry = (int16_t)(SS_EYE_RY * scleraScale);
+        switch (activeMood)
+        {
+        case EYE_ANGRY:
+            ssDrawAngryBrow(ssEyeSprite, rx, ry, isLeftEye);
+            break;
+        case EYE_CURIOUS:
+            ssDrawCuriousBrow(ssEyeSprite, rx, ry, isLeftEye);
+            break;
+        case EYE_SUSPICIOUS:
+            ssDrawSuspiciousBrow(ssEyeSprite, rx, ry);
+            break;
+        default:
+            break;
+        }
+    }
+
+    ssEyeSprite.pushSprite(boxX, boxY);
+}
+
+static EyeMood ssPickWeightedMood(unsigned long &durationMsOut)
+{
+    int total = 0;
+    for (const auto &m : SS_MOOD_TABLE)
+        total += m.weight;
+    int r = random(0, total);
+    for (const auto &m : SS_MOOD_TABLE)
+    {
+        if (r < m.weight)
+        {
+            durationMsOut = random(m.minMs, m.maxMs + 1);
+            return m.mood;
+        }
+        r -= m.weight;
+    }
+    durationMsOut = 1000;
+    return EYE_NEUTRAL;
+}
+
+// Advances the star twinkle / eye animation and (re)draws whatever changed.
+// Call this on every loop() pass while the screensaver is active; it
+// rate-limits its own redraws internally.
+static void runScreensaverEye(unsigned long nowMs)
+{
+    static unsigned long lastCallMs = 0;
+    static bool everCalled = false;
+    static unsigned long lastStarRefresh = 0;
+    static unsigned long lastEyeFrame = 0;
+    static bool resting = true; // resting (neutral) vs. acting out currentMood
+    static EyeMood currentMood = EYE_NEUTRAL;
+    static unsigned long moodStartMs = 0;
+    static unsigned long phaseUntilMs = 0;
+    static float curDX = 0, curDY = 0, curOpen = 1.0f, curPupilScale = 1.0f, curScleraScale = 1.0f;
+    static float curWinkOpen = 1.0f;
+    static bool winkLeftClosed = true; // which eye stays shut for the current EYE_WINK bout
+
+    if (!ssStarsReady)
+        ssInitStars();
+
+    // A long gap since the previous call means the screensaver just (re)woke
+    // up — this is the one time we repaint the whole background and reset
+    // the eyes, rather than incrementally updating what's already on screen.
+    bool justEntered = !everCalled || (nowMs - lastCallMs > 5000UL);
+    everCalled = true;
+    lastCallMs = nowMs;
+    if (justEntered)
+    {
+        ssDrawStarfield(nowMs);
+        lastStarRefresh = nowMs;
+        lastEyeFrame = 0;
+        resting = true;
+        moodStartMs = nowMs;
+        phaseUntilMs = nowMs;
+        curDX = curDY = 0.0f;
+        curOpen = curPupilScale = curScleraScale = 1.0f;
+    }
+
+    const unsigned long STAR_REFRESH_MS = 600;
+    const unsigned long EYE_FRAME_MS = 70;
+
+    if (nowMs - lastStarRefresh >= STAR_REFRESH_MS)
+    {
+        lastStarRefresh = nowMs;
+        ssTwinkleStars(nowMs);
+    }
+
+    if (nowMs - lastEyeFrame < EYE_FRAME_MS)
+        return;
+    lastEyeFrame = nowMs;
+
+    if (!ssEnsureSprite())
+        return;
+
+    // Advance the resting/acting state machine.  Signed-diff comparison so
+    // this keeps working correctly across the millis() rollover at ~49 days.
+    if ((long)(nowMs - phaseUntilMs) >= 0)
+    {
+        if (resting)
+        {
+            unsigned long duration;
+            currentMood = ssPickWeightedMood(duration);
+            resting = false;
+            moodStartMs = nowMs;
+            phaseUntilMs = nowMs + duration;
+            if (currentMood == EYE_WINK)
+                winkLeftClosed = random(0, 2) == 0;
+        }
+        else
+        {
+            resting = true;
+            moodStartMs = nowMs;
+            phaseUntilMs = nowMs + random(500, 1800);
+        }
+    }
+
+    unsigned long elapsed = nowMs - moodStartMs;
+    EyeMood activeMood = resting ? EYE_NEUTRAL : currentMood;
+
+    int16_t targetDX = 0, targetDY = 0;
+    float targetOpen = 1.0f, targetPupilScale = 1.0f, targetScleraScale = 1.0f;
+    float targetWinkOpen = 1.0f; // only applied to whichever eye is winking
+    bool special = false; // happy/sad/asleep get their own hand-drawn shape
+    bool snapOpen = false;
+
+    switch (activeMood)
+    {
+    case EYE_NEUTRAL:
+        targetDX = (int16_t)(sinf(nowMs / 1400.0f) * 3.5f);
+        targetDY = (int16_t)(cosf(nowMs / 2100.0f) * 2.0f);
+        break;
+    case EYE_BLINK:
+    {
+        float progress = constrain((float)elapsed / (float)(phaseUntilMs - moodStartMs), 0.0f, 1.0f);
+        targetOpen = progress < 0.5f ? 1.0f - progress * 2.0f : (progress - 0.5f) * 2.0f;
+        snapOpen = true; // blinks should be crisp, not eased
+        break;
+    }
+    case EYE_LOOK_LEFT:
+        targetDX = -24;
+        break;
+    case EYE_LOOK_RIGHT:
+        targetDX = 24;
+        break;
+    case EYE_LOOK_UP:
+        targetDY = -14;
+        break;
+    case EYE_LOOK_DOWN:
+        targetDY = 13;
+        break;
+    case EYE_SURPRISED:
+        targetScleraScale = 1.22f;
+        targetPupilScale = 0.55f;
+        break;
+    case EYE_BORED:
+        targetDX = (int16_t)(sinf(elapsed / 700.0f) * 16);
+        targetOpen = 0.5f;
+        break;
+    case EYE_SLEEPY:
+        targetOpen = constrain(0.5f + 0.35f * sinf(elapsed / 480.0f), 0.15f, 0.9f);
+        break;
+    case EYE_SQUINT:
+        targetOpen = 0.22f;
+        break;
+    case EYE_ASLEEP:
+    case EYE_HAPPY:
+    case EYE_SAD:
+        special = true;
+        break;
+    case EYE_ANGRY:
+        targetOpen = 0.75f;
+        targetPupilScale = 0.8f;
+        break;
+    case EYE_WINK:
+    {
+        float progress = constrain((float)elapsed / (float)(phaseUntilMs - moodStartMs), 0.0f, 1.0f);
+        targetWinkOpen = progress < 0.5f ? 1.0f - progress * 2.0f : (progress - 0.5f) * 2.0f;
+        snapOpen = true; // wink should snap shut/open crisply, like a blink
+        break;
+    }
+    case EYE_CURIOUS:
+        targetDX = (int16_t)(sinf(elapsed / 500.0f) * 6.0f); // slight questioning tilt
+        targetScleraScale = 1.06f;
+        break;
+    case EYE_SUSPICIOUS:
+        targetDX = (int16_t)(sinf(elapsed / 900.0f) * 20.0f); // slow, sneaky sideways glance
+        targetOpen = 0.4f;
+        targetPupilScale = 0.85f;
+        break;
+    }
+
+    const float ease = 0.3f;
+    curDX += (targetDX - curDX) * ease;
+    curDY += (targetDY - curDY) * ease;
+    curOpen = snapOpen ? targetOpen : curOpen + (targetOpen - curOpen) * ease;
+    curWinkOpen = snapOpen ? targetWinkOpen : curWinkOpen + (targetWinkOpen - curWinkOpen) * ease;
+    curPupilScale += (targetPupilScale - curPupilScale) * ease;
+    curScleraScale += (targetScleraScale - curScleraScale) * ease;
+
+    int16_t dx = (int16_t)curDX, dy = (int16_t)curDY;
+    float leftOpen = curOpen, rightOpen = curOpen;
+    if (activeMood == EYE_WINK)
+    {
+        if (winkLeftClosed)
+            leftOpen = curWinkOpen;
+        else
+            rightOpen = curWinkOpen;
+    }
+    ssRenderEyeBox(SS_LEFT_BOX_X, SS_BOX_Y, nowMs, elapsed, special, activeMood, dx, dy, leftOpen, curPupilScale, curScleraScale, true);
+    ssRenderEyeBox(SS_RIGHT_BOX_X, SS_BOX_Y, nowMs, elapsed, special, activeMood, dx, dy, rightOpen, curPupilScale, curScleraScale, false);
+}
+
+// ---------------------------------------------------------------------------
+// 🎬 Screensaver easter eggs: every couple of minutes the eyes step aside for
+// a short homage — HAL 9000's glowing lens or KITT's scanning light bar —
+// before handing back to the eyes.
+// Each scene only ever recolors or newly reveals pixels at fixed positions
+// (never erases-then-redraws a moving shape directly on the TFT), which is
+// what keeps them flicker-free without needing their own sprite; the one
+// exception is KITT's moving bar, which genuinely relocates every frame and
+// so gets a small reusable sprite of its own, same trick as the eyes.
+// ---------------------------------------------------------------------------
+enum ScreensaverScene
+{
+    SCENE_EYES,
+    SCENE_HAL9000,
+    SCENE_KITT,
+};
+
+struct SceneSpec
+{
+    ScreensaverScene scene;
+    uint16_t minMs, maxMs;
+    uint8_t weight;
+};
+static const SceneSpec SS_SCENE_TABLE[] = {
+    {SCENE_HAL9000, 7500, 10500, 1},
+    {SCENE_KITT, 8000, 12500, 1},
+};
+
+static ScreensaverScene ssScene = SCENE_EYES;
+static unsigned long ssSceneUntilMs = 0;
+static unsigned long ssSceneStartMs = 0;
+static unsigned long ssNextSpecialMs = 0; // 0 = "not scheduled yet", (re)armed on entering EYES
+
+static ScreensaverScene ssPickScene(unsigned long &durationMsOut)
+{
+    int total = 0;
+    for (const auto &s : SS_SCENE_TABLE)
+        total += s.weight;
+    int r = random(0, total);
+    for (const auto &s : SS_SCENE_TABLE)
+    {
+        if (r < s.weight)
+        {
+            durationMsOut = random(s.minMs, s.maxMs + 1);
+            return s.scene;
+        }
+        r -= s.weight;
+    }
+    durationMsOut = 8000;
+    return SCENE_HAL9000;
+}
+
+// HAL 9000: a slowly breathing red lens that eventually types out its line.
+static void ssRunHal9000(unsigned long nowMs, unsigned long elapsed, bool justEntered)
+{
+    static unsigned long lastPulse = 0;
+    static unsigned long lastChar = 0;
+    static int totalRevealed = 0;
+    static int lastDrawn = -1;
+
+    if (justEntered)
+    {
+        tft.fillScreen(TFT_BLACK);
+        lastPulse = 0;
+        lastChar = 0;
+        totalRevealed = 0;
+        lastDrawn = -1;
+    }
+
+    const int16_t cx = 160, cy = 95;
+    if (nowMs - lastPulse >= 120)
+    {
+        lastPulse = nowMs;
+        float pulse = 0.5f + 0.5f * sinf(nowMs / 480.0f);
+        uint8_t r = (uint8_t)(160 + pulse * 70);
+        // Same shapes at the same spot every tick, just recoloured — no
+        // erase step needed, so the pulse can't flicker.
+        tft.fillCircle(cx, cy, 46, TFT_DARKGREY);
+        tft.fillCircle(cx, cy, 40, TFT_BLACK);
+        tft.fillCircle(cx, cy, 37, tft.color565(r, 12, 8));
+        tft.fillCircle(cx - 12, cy - 12, 6, TFT_WHITE);
+    }
+
+    static const char *HAL_LINES[3] = {"I'm sorry, Dave.", "I'm afraid I can't", "do that."};
+    static const int16_t HAL_LINE_Y[3] = {160, 184, 208};
+    static int halLineLen[3] = {-1, -1, -1};
+    if (halLineLen[0] < 0)
+        for (int i = 0; i < 3; i++)
+            halLineLen[i] = strlen(HAL_LINES[i]);
+    int totalLen = halLineLen[0] + halLineLen[1] + halLineLen[2];
+
+    // A beat of silence before HAL starts "speaking", then a steady typewriter reveal.
+    if (elapsed > 700UL && totalRevealed < totalLen && nowMs - lastChar >= 45UL)
+    {
+        lastChar = nowMs;
+        totalRevealed++;
+    }
+
+    if (totalRevealed != lastDrawn)
+    {
+        lastDrawn = totalRevealed;
+        tft.setTextFont(2);
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        int shown = totalRevealed;
+        char buf[24];
+        for (int i = 0; i < 3; i++)
+        {
+            int len = halLineLen[i];
+            int lineShown = shown < 0 ? 0 : (shown > len ? len : shown);
+            shown -= len;
+            if (lineShown <= 0)
+                continue;
+            memcpy(buf, HAL_LINES[i], lineShown);
+            buf[lineShown] = '\0';
+            int16_t x = (320 - tft.textWidth(HAL_LINES[i])) / 2;
+            tft.setCursor(x, HAL_LINE_Y[i]);
+            tft.print(buf);
+        }
+    }
+}
+
+// KITT / Cylon scanner: a red LED bar that bounces back and forth.
+static const int16_t SS_KITT_X = 10, SS_KITT_Y = 108, SS_KITT_W = 300, SS_KITT_H = 40;
+static TFT_eSprite ssKittSprite(&tft);
+static bool ssKittSpriteReady = false;
+
+static bool ssEnsureKittSprite()
+{
+    if (!ssKittSpriteReady)
+    {
+        ssKittSprite.setColorDepth(8);
+        ssKittSpriteReady = ssKittSprite.createSprite(SS_KITT_W, SS_KITT_H) != nullptr;
+        if (!ssKittSpriteReady)
+            Serial.println("⚠️ Screensaver KITT sprite allocation failed — skipping scanner animation.");
+    }
+    return ssKittSpriteReady;
+}
+
+static void ssRunKitt(unsigned long nowMs, unsigned long elapsed, bool justEntered)
+{
+    if (justEntered)
+        tft.fillScreen(TFT_BLACK);
+
+    static unsigned long lastFrame = 0;
+    if (nowMs - lastFrame < 35UL)
+        return;
+    lastFrame = nowMs;
+
+    if (!ssEnsureKittSprite())
+        return;
+
+    const int N = 15;
+    const int16_t gap = 3;
+    const int16_t segW = (SS_KITT_W - (N - 1) * gap) / N;
+
+    // Bounces 0..N-1..0 — a classic triangle wave, not a sine, so it holds
+    // its speed all the way to each end instead of easing into the turn.
+    const float periodMs = 950.0f;
+    float phase = fmodf((float)elapsed, periodMs * 2.0f) / periodMs;
+    float pos = (phase < 1.0f) ? phase * (N - 1) : (2.0f - phase) * (N - 1);
+
+    ssKittSprite.fillSprite(TFT_BLACK);
+    for (int i = 0; i < N; i++)
+    {
+        float d = fabsf((float)i - pos);
+        float glow = d < 2.4f ? constrain(1.0f - d / 2.4f, 0.0f, 1.0f) : 0.0f;
+        uint8_t r = (uint8_t)(25 + glow * 230);
+        uint8_t g = (uint8_t)(glow * 40);
+        uint16_t color = ssKittSprite.color565(r, g, 0);
+        int16_t segX = i * (segW + gap);
+        ssKittSprite.fillRoundRect(segX, 6, segW, SS_KITT_H - 12, 3, color);
+    }
+    ssKittSprite.pushSprite(SS_KITT_X, SS_KITT_Y);
+}
+
+// The eye (18 KB) and KITT (12 KB) sprites sit in the middle of the heap and
+// leave no block big enough for a TLS session, so every HTTPS fetch failed
+// once the screensaver had run.  They are freed when it is dismissed and
+// before each fetch; the next frame simply allocates them again.
+static void ssReleaseSprites()
+{
+    if (ssSpriteReady)
+    {
+        ssEyeSprite.deleteSprite();
+        ssSpriteReady = false;
+    }
+    if (ssKittSpriteReady)
+    {
+        ssKittSprite.deleteSprite();
+        ssKittSpriteReady = false;
+    }
+}
+
+// A quick "eyes widen, then blink shut" reaction so dismissing the eyes by
+// touch actually reads as the eyes noticing and closing — an animated beat
+// that's part of the screensaver itself — rather than an abrupt cut straight
+// to the clock with the eyes still open mid-frame.
+static void ssBlinkShutOnDismiss(unsigned long nowMs)
+{
+    if (!ssEnsureSprite())
+        return;
+    ssRenderEyeBox(SS_LEFT_BOX_X, SS_BOX_Y, nowMs, 0, false, EYE_NEUTRAL, 0, 0, 1.0f, 0.6f, 1.15f, true);
+    ssRenderEyeBox(SS_RIGHT_BOX_X, SS_BOX_Y, nowMs, 0, false, EYE_NEUTRAL, 0, 0, 1.0f, 0.6f, 1.15f, false);
+    delay(120);
+    ssRenderEyeBox(SS_LEFT_BOX_X, SS_BOX_Y, nowMs, 0, false, EYE_NEUTRAL, 0, 0, 0.0f, 1.0f, 1.0f, true);
+    ssRenderEyeBox(SS_RIGHT_BOX_X, SS_BOX_Y, nowMs, 0, false, EYE_NEUTRAL, 0, 0, 0.0f, 1.0f, 1.0f, false);
+    delay(180);
+}
+
+// Resets the scene machine back to the eyes — called whenever the
+// screensaver itself is dismissed, so re-entering it later never resumes
+// mid-scene against a screen that's since shown the normal clock UI.
+static void ssResetScreensaver()
+{
+    ssScene = SCENE_EYES;
+    ssNextSpecialMs = 0;
+    ssReleaseSprites();
+}
+
+// Top-level screensaver dispatcher: runs the eyes most of the time, and
+// occasionally hands off to one of the special-scene homages above for a
+// while before returning. Call this every loop() pass while the screensaver
+// is active.
+static void runScreensaver(unsigned long nowMs)
+{
+    static bool sceneJustEntered = false;
+
+    if (ssScene == SCENE_EYES)
+    {
+        runScreensaverEye(nowMs);
+
+        if (ssNextSpecialMs == 0)
+            ssNextSpecialMs = nowMs + random(45000, 90000);
+
+        if ((long)(nowMs - ssNextSpecialMs) >= 0)
+        {
+            unsigned long duration;
+            ssScene = ssPickScene(duration);
+            ssSceneStartMs = nowMs;
+            ssSceneUntilMs = nowMs + duration;
+            sceneJustEntered = true;
+        }
+        return;
+    }
+
+    unsigned long elapsed = nowMs - ssSceneStartMs;
+    switch (ssScene)
+    {
+    case SCENE_HAL9000:
+        ssRunHal9000(nowMs, elapsed, sceneJustEntered);
+        break;
+    case SCENE_KITT:
+        ssRunKitt(nowMs, elapsed, sceneJustEntered);
+        break;
+    default:
+        break;
+    }
+    sceneJustEntered = false;
+
+    if ((long)(nowMs - ssSceneUntilMs) >= 0)
+    {
+        ssScene = SCENE_EYES;
+        ssNextSpecialMs = nowMs + random(45000, 90000);
     }
 }
 
@@ -1012,7 +1854,6 @@ void loop()
     static unsigned long previousMillisForAutoPageChanger = 0;
     static unsigned long previousMillisForBlinkDotsOnBigClock = 0;
 
-    static unsigned long lastDotUpdate = 0;
     static bool screenSaver = false;
 
     static bool alertBannerShowing = false;
@@ -1055,6 +1896,7 @@ void loop()
     // 7 polled, so the other pages let the clock free-run.  NTPClient rate-limits
     // itself to its update interval, so calling this every pass is cheap.
     ntpTick();
+    applyLocalOffset();
 
     if (!screenSaver)
     {
@@ -1062,7 +1904,9 @@ void loop()
     }
 
     // 🌤️ Weather from Open-Meteo, on the interval set in the web interface.
-    if (currentMillis - previousMillisForWeatherDataUpdate >= weatherIntervalMs())
+    // After a failed fetch it is retried every minute instead.
+    unsigned long weatherWaitMs = weatherFetchOk ? weatherIntervalMs() : 60UL * 1000UL;
+    if (currentMillis - previousMillisForWeatherDataUpdate >= weatherWaitMs)
     {
         previousMillisForWeatherDataUpdate = currentMillis;
         Serial.printf("Getting fresh weather data (every %u min)\n", weatherIntervalMin);
@@ -1083,38 +1927,24 @@ void loop()
     }
 
     // Check for inactivity → Enable screensaver
-    if (!screenSaver && currentMillis - lastActivity > screenSaverTimeout)
+    if (useScreenSaver && !screenSaver && currentMillis - lastActivity > screenSaverTimeout)
     {
-        if (screenSaverTimeout != 7200000)
-        {
-            screenSaver = true;
-            Serial.println("⏳ Inactivity detected — entering screensaver.");
-        }
+        screenSaver = true;
+        Serial.println("⏳ Inactivity detected — entering screensaver.");
     }
 
     // 💤 Screensaver Mode
     if (screenSaver)
     {
-        // 🌈 Refresh random pixel animation every 1 second
-        if (currentMillis - lastDotUpdate >= 1000)
-        {
-            tft.fillScreen(TFT_BLACK);
-
-            for (int i = 0; i < 200; i++)
-            {
-                int x = random(0, 320);
-                int y = random(0, 240);
-                uint16_t color = tft.color565(random(256), random(256), random(256));
-                tft.drawPixel(x, y, color);
-            }
-
-            lastDotUpdate = currentMillis;
-        }
+        runScreensaver(currentMillis);
         uint16_t x, y;
         if (readTouchPoint(&x, &y))
         {
             Serial.println("🖐 Touch detected — exiting screensaver.");
+            if (ssScene == SCENE_EYES)
+                ssBlinkShutOnDismiss(currentMillis);
             screenSaver = false;
+            ssResetScreensaver();
             Serial.println("📄 Active page -> 1");
             activatePage(1);
             lastActivity = currentMillis; // 🔄 Reset inactivity timer
@@ -1123,6 +1953,15 @@ void loop()
         {
             Serial.println("\U0001F6F0 Satellite alert — exiting screensaver.");
             screenSaver = false;
+            ssResetScreensaver();
+            activatePage(1);
+            lastActivity = currentMillis;
+        }
+        else if (!useScreenSaver)
+        {
+            Serial.println("Screensaver switched off — exiting screensaver.");
+            screenSaver = false;
+            ssResetScreensaver();
             activatePage(1);
             lastActivity = currentMillis;
         }
@@ -1418,9 +2257,109 @@ static void fetchPlaceName()
     }
 }
 
+// Local time zone, learned from Open-Meteo and kept in NVS.  For zones on the
+// EU daylight saving rule the switch is computed here, so the clock changes
+// over on time even when the weather fetch is failing; other zones just keep
+// the offset of the last successful fetch.
+static char tzName[40] = "";
+static int tzStdOffset = 0;    // hours, without daylight saving
+static bool tzEuRule = false;
+
+static bool zoneUsesEuRule(const char *name)
+{
+    static const char *const noDst[] = {
+        "Europe/Moscow", "Europe/Minsk", "Europe/Istanbul", "Europe/Kaliningrad",
+        "Europe/Samara", "Europe/Volgograd", "Europe/Saratov", "Europe/Ulyanovsk",
+        "Europe/Astrakhan", "Europe/Kirov", "Europe/Simferopol"};
+    if (!strcmp(name, "Atlantic/Canary") || !strcmp(name, "Atlantic/Madeira") ||
+        !strcmp(name, "Atlantic/Faroe"))
+        return true;
+    if (strncmp(name, "Europe/", 7) != 0) return false;
+    for (const char *z : noDst)
+        if (!strcmp(name, z)) return false;
+    return true;
+}
+
+// Last Sunday of the month, at hourUtc.  month is 3 or 10, so month + 1 never wraps.
+static time_t lastSundayUtc(int yr, int month, int hourUtc)
+{
+    tmElements_t e = {};
+    e.Year = CalendarYrToTm(yr);
+    e.Month = month + 1;
+    e.Day = 1;
+    e.Hour = hourUtc;
+    time_t t = makeTime(e) - SECS_PER_DAY; // last day of the month
+    return t - (time_t)(weekday(t) - 1) * SECS_PER_DAY;
+}
+
+// EU summer time: last Sunday of March to last Sunday of October, 01:00 UTC.
+static bool euDstActive(time_t utc)
+{
+    int yr = year(utc);
+    return utc >= lastSundayUtc(yr, 3, 1) && utc < lastSundayUtc(yr, 10, 1);
+}
+
+static void rememberTimeZone(const char *name, int offsetHours)
+{
+    if (!name[0]) return;
+    bool eu = zoneUsesEuRule(name);
+    int stdOffset = offsetHours - ((eu && euDstActive(timeClient.getEpochTime())) ? 1 : 0);
+    if (strcmp(name, tzName) == 0 && stdOffset == tzStdOffset) return;
+
+    strlcpy(tzName, name, sizeof(tzName));
+    tzStdOffset = stdOffset;
+    tzEuRule = eu;
+    prefs.begin("timezone", false);
+    prefs.putString("name", tzName);
+    prefs.putInt("stdOffset", tzStdOffset);
+    prefs.end();
+    Serial.printf("Time zone %s, standard offset %+d h%s\n", tzName, tzStdOffset,
+                  tzEuRule ? ", EU daylight saving" : "");
+}
+
+static void loadTimeZone()
+{
+    prefs.begin("timezone", true);
+    String name = prefs.getString("name", "");
+    tzStdOffset = prefs.getInt("stdOffset", 0);
+    prefs.end();
+    strlcpy(tzName, name.c_str(), sizeof(tzName));
+    tzEuRule = tzName[0] && zoneUsesEuRule(tzName);
+}
+
+// Called every loop pass: keeps tOffset right across the daylight saving switch.
+static void applyLocalOffset()
+{
+    if (!tzEuRule) return;
+    int newOffset = tzStdOffset + (euDstActive(timeClient.getEpochTime()) ? 1 : 0);
+    if (newOffset != tOffset)
+    {
+        Serial.printf("\U0001F570️ UTC offset %+d h (was %+d), %s\n", newOffset, tOffset, tzName);
+        tOffset = newOffset;
+    }
+}
+
+// A failed fetch keeps the last good readings on screen; the "Updated N min
+// ago" footer turns orange once they get old.  The page only goes blank when
+// there has never been a successful fetch.
+static void weatherFetchFailed(const char *why)
+{
+    Serial.printf("Open-Meteo: %s (free heap %u, largest block %u)\n", why,
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    weatherFetchOk = false;
+    if (!weather.valid)
+    {
+        scrollText = "Sorry, No Weather Info At This Moment!!!            Open-Meteo did not answer.";
+        scrollingTextXposition = scrollingText.width();
+    }
+    redrawWeatherPage = true;
+}
+
 // Fetch weather data
 void fetchWeatherData()
 {
+    ssReleaseSprites(); // TLS needs the room
     if (weather.city[0] == 0) fetchPlaceName();
 
     HTTPClient http;
@@ -1438,10 +2377,7 @@ void fetchWeatherData()
     http.setTimeout(12000);
     if (!http.begin(url))
     {
-        Serial.println("Open-Meteo: http begin failed");
-        weatherFetchOk = false;
-        weather.valid = false;
-        redrawWeatherPage = true;
+        weatherFetchFailed("http begin failed");
         return;
     }
 
@@ -1453,12 +2389,10 @@ void fetchWeatherData()
 
     if (httpCode != HTTP_CODE_OK || payload.isEmpty())
     {
-        Serial.printf("Error fetching weather data, HTTP code: %d\n", httpCode);
-        scrollText = "Sorry, No Weather Info At This Moment!!!            Open-Meteo did not answer.";
-        scrollingTextXposition = scrollingText.width();
-        weatherFetchOk = false;
-        weather.valid = false;
-        redrawWeatherPage = true;
+        char why[64];
+        snprintf(why, sizeof(why), "HTTP code %d (%s)", httpCode,
+                 HTTPClient::errorToString(httpCode).c_str());
+        weatherFetchFailed(why);
         return;
     }
 
@@ -1468,10 +2402,9 @@ void fetchWeatherData()
 
     if (err)
     {
-        Serial.printf("Open-Meteo parse failed: %s\n", err.c_str());
-        weatherFetchOk = false;
-        weather.valid = false;
-        redrawWeatherPage = true;
+        char why[48];
+        snprintf(why, sizeof(why), "parse failed: %s", err.c_str());
+        weatherFetchFailed(why);
         return;
     }
 
@@ -1479,15 +2412,14 @@ void fetchWeatherData()
     JsonObject day = doc["daily"];
     if (cur.isNull() || day.isNull())
     {
-        Serial.println("Open-Meteo reply had no current block");
-        weatherFetchOk = false;
-        weather.valid = false;
-        redrawWeatherPage = true;
+        weatherFetchFailed("reply had no current block");
         return;
     }
 
-    // The offset comes with the weather, so daylight saving follows by itself.
+    // The offset comes with the weather.  The zone name is kept as well, so the
+    // daylight saving switch also happens when a later fetch fails.
     int newOffset = (int)((long)(doc["utc_offset_seconds"] | 0) / 3600);
+    rememberTimeZone(doc["timezone"] | "", newOffset);
     if (newOffset != tOffset)
         Serial.printf("\U0001F570\uFE0F UTC offset %+d h (was %+d)\n", newOffset, tOffset);
     tOffset = newOffset;
@@ -1686,6 +2618,12 @@ void loadSettings()
     screenSaverTimeout = doc["screenSaverTimeout"] | screenSaverTimeout;
     autoPageChange = doc["autoPageChange"] | autoPageChange;
     useScreenSaver = doc["useScreenSaver"] | useScreenSaver;
+    // The slider at 120 min used to mean "off"; that is the switch's job now.
+    if (screenSaverTimeout == 7200000UL)
+    {
+        useScreenSaver = false;
+        screenSaverTimeout = 60UL * 60000UL;
+    }
     bigClockShowsUtc = doc["bigClockShowsUtc"] | bigClockShowsUtc;
     bigClockStyle = doc["bigClockStyle"] | bigClockStyle;
     if (bigClockStyle >= BIGCLOCK_STYLE_COUNT) bigClockStyle = BIGCLOCK_SEVENSEG;
@@ -2314,6 +3252,8 @@ static String xmlAttr(const String &src, int tagStart, const char *attr)
 
 void fetchSolarData()
 {
+
+    ssReleaseSprites(); // TLS needs the room
 
     // Fetch XML
     HTTPClient http;
@@ -3636,9 +4576,9 @@ void updateWeatherPageClock()
     snprintf(buf, sizeof(buf), "Updated %ld min ago", ageMin);
     snprintf(padded, sizeof(padded), "%-26s", buf);
 
-    // The fetch runs every five minutes, so anything much older means the
-    // requests are failing.
-    tft.setTextColor(ageMin > 15 ? TFT_ORANGE : themeDim, themeBg);
+    // Anything older than the refresh interval means the requests are failing
+    // and these are the last good readings.
+    tft.setTextColor(ageMin > weatherIntervalMin + 2 ? TFT_ORANGE : themeDim, themeBg);
     tft.drawString(padded, WX_LLABEL, WX_FOOT);
 }
 
